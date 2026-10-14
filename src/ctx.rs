@@ -17,12 +17,20 @@ fn tracked(store: &Store) -> HashSet<String> {
         .collect()
 }
 
+/// Each tracked branch's configured upstream: (branch.<b>.remote, branch.<b>.merge).
+fn upstreams(repo: &gix::Repository, branches: &HashSet<String>) -> HashMap<String, (String, String)> {
+    let cfg = repo.config_snapshot();
+    let get = |b: &str, k: &str| cfg.string(format!("branch.{b}.{k}").as_str()).map(|v| v.to_string()).unwrap_or_default();
+    branches.iter().map(|b| (b.clone(), (get(b, "remote"), get(b, "merge")))).collect()
+}
+
 pub struct Ctx {
     pub info: RepoInfo,
     pub store: Store,
     pub remote: String,
     pub refs: Refs,
     pub worktrees: HashMap<String, PathBuf>,
+    upstreams: HashMap<String, (String, String)>,
     lock: Option<Lock>,
     gh: OnceCell<Client>,
 }
@@ -36,9 +44,11 @@ impl Ctx {
         let lock = if mutating { Some(Lock::acquire(&info.common_dir)?) } else { None };
         let store = Store::load(&info.common_dir)?;
         let remote = std::env::var("GT_REMOTE").unwrap_or_else(|_| "origin".into());
-        let refs = Refs::load(&repo, &remote, &tracked(&store))?;
+        let tracked = tracked(&store);
+        let refs = Refs::load(&repo, &remote, &tracked)?;
         let worktrees = git::worktrees(&info.common_dir);
-        Ok(Ctx { info, store, remote, refs, worktrees, lock, gh: OnceCell::new() })
+        let upstreams = upstreams(&repo, &tracked);
+        Ok(Ctx { info, store, remote, refs, worktrees, upstreams, lock, gh: OnceCell::new() })
     }
 
     pub fn gh(&self) -> Result<&Client> {
@@ -59,9 +69,37 @@ impl Ctx {
         // A fresh handle so ref and object caches see what git just wrote.
         let repo = git::open()?;
         self.info = git::repo_info(&repo)?;
-        self.refs = Refs::load(&repo, &self.remote, &tracked(&self.store))?;
+        let tracked = tracked(&self.store);
+        self.refs = Refs::load(&repo, &self.remote, &tracked)?;
         self.worktrees = git::worktrees(&self.info.common_dir);
+        self.upstreams = upstreams(&repo, &tracked);
         Ok(())
+    }
+
+    /// Points each branch's upstream at the same-named branch on the remote,
+    /// which is what `gh pr view`/`gh pr status` and editors use to find its PR.
+    /// Only touches branches that exist on the remote and aren't already set up.
+    pub fn ensure_upstreams<'a>(&self, branches: impl IntoIterator<Item = &'a str>) {
+        for b in branches {
+            if !self.refs.heads.contains_key(b) || !self.refs.remote.contains_key(b) {
+                continue;
+            }
+            let want = (self.remote.clone(), format!("refs/heads/{b}"));
+            if self.upstreams.get(b) == Some(&want) {
+                continue;
+            }
+            let upstream = format!("--set-upstream-to={}", self.remote_ref(b));
+            if let Err(e) = git::run(&["branch", "--quiet", &upstream, b]) {
+                crate::ui::warn(&format!("couldn't set upstream of {b}: {e:#}"));
+            }
+        }
+    }
+
+    /// Every stacked branch and trunk across all stacks.
+    pub fn all_branches(&self) -> Vec<String> {
+        let mut v: Vec<String> = tracked(&self.store).into_iter().collect();
+        v.sort();
+        v
     }
 
     pub fn save(&mut self) -> Result<()> {

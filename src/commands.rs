@@ -122,6 +122,7 @@ fn branch_line(ctx: &Ctx, stack: &Stack, idx: usize, prs: &HashMap<String, Pr>, 
         None => String::new(),
     };
     let mut badges: Vec<String> = worktree_badge(ctx, &b.branch).into_iter().collect();
+    badges.extend(author_badge(ctx, &b.branch));
     if b.merged() {
         badges.push(ui::magenta("merged"));
     } else {
@@ -156,6 +157,17 @@ fn render_stacks(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bo
     }
 }
 
+/// "by <name>" for a branch whose commit someone else authored. Nothing when
+/// it's yours, or when gt doesn't know who you are.
+fn author_badge(ctx: &Ctx, branch: &str) -> Option<String> {
+    let c = ctx.refs.heads.get(branch)?;
+    if ctx.info.me.is_empty() || c.author_email.is_empty() && c.author_name.is_empty() {
+        return None;
+    }
+    let mine = [&c.author_email, &c.author_name].iter().any(|v| ctx.info.me.contains(&v.to_lowercase()));
+    (!mine).then(|| ui::blue(&format!("by {}", c.author_name)))
+}
+
 /// Dim "in <worktree>" badge for a branch checked out in another worktree.
 fn worktree_badge(ctx: &Ctx, branch: &str) -> Option<String> {
     let wt = ctx.other_worktree(branch)?;
@@ -170,8 +182,11 @@ struct Row {
 }
 
 /// The graph as lines, bottom stack last, trunk at the bottom of each group.
+/// Merged branches are only drawn while they still exist locally (gh-stack
+/// keeps them in its state as history).
 fn graph_rows(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bool) -> Vec<Row> {
     let cur = ctx.info.current_branch.as_deref();
+    let shown = |b: &BranchRef| !b.merged() || ctx.refs.heads.contains_key(&b.branch);
     let mut rows = vec![];
     let mut groups: Vec<(&str, Vec<&Stack>)> = vec![];
     for &si in sis {
@@ -186,7 +201,7 @@ fn graph_rows(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bool)
             rows.push(Row { text: String::new(), branch: None, is_trunk: false });
         }
         let cols = stacks.len();
-        let branches = || stacks.iter().flat_map(|s| &s.branches);
+        let branches = || stacks.iter().flat_map(|s| &s.branches).filter(|b| shown(b));
         let layout = Cols {
             width: branches().map(|b| b.branch.len()).max().unwrap_or(0),
             pr: branches().any(|b| prs.contains_key(&b.branch) || b.pr_number().is_some()),
@@ -195,7 +210,7 @@ fn graph_rows(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bool)
         for (col, stack) in stacks.iter().enumerate() {
             let rails = ui::dim(&"│ ".repeat(col));
             let pad = "  ".repeat(cols - col - 1);
-            for (idx, b) in stack.branches.iter().enumerate().rev() {
+            for (idx, b) in stack.branches.iter().enumerate().rev().filter(|(_, b)| shown(b)) {
                 let marker = if b.merged() {
                     ui::dim("◌")
                 } else if cur == Some(&b.branch) {
@@ -302,6 +317,7 @@ fn checkout(ctx: &Ctx, branch: &str) -> Result<()> {
     if !out.ok {
         bail!("{}", out.stderr.trim());
     }
+    ctx.ensure_upstreams([branch]);
     ui::ok(&format!("checked out {}", ui::bold(branch)));
     Ok(())
 }
@@ -878,6 +894,7 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
 
     restack::record_heads(&mut ctx);
     ctx.save()?;
+    ctx.ensure_upstreams(ctx.all_branches().iter().map(String::as_str));
     let (done, live): (Vec<usize>, Vec<usize>) = sis.iter().partition(|&&si| ctx.store.file.stacks[si].fully_merged());
     for si in done {
         ui::ok(&format!("stack on {} is fully merged", ctx.store.file.stacks[si].trunk.branch));
@@ -1060,6 +1077,7 @@ pub fn submit(draft: bool, no_verify: bool, relink: bool) -> Result<()> {
     let (repo_id, prs) = fetch_prs(&ctx, &[si], false)?;
     push(&ctx, &needs_push(&ctx, si), no_verify)?;
     ctx.reload()?;
+    ctx.ensure_upstreams(ctx.all_branches().iter().map(String::as_str));
 
     let stack = ctx.store.file.stacks[si].clone();
     let mut batch = MutationBatch::default();
@@ -1237,6 +1255,7 @@ pub fn get(target: String) -> Result<()> {
     ctx.reload()?;
     restack::record_heads(&mut ctx);
     ctx.save()?;
+    ctx.ensure_upstreams(ctx.all_branches().iter().map(String::as_str));
     let target_branch = entries.iter().find(|e| e.0 == number).map(|e| e.1.clone()).unwrap();
     ui::ok(&format!("tracked {} branch(es) on {trunk}", entries.len()));
     checkout(&ctx, &target_branch)

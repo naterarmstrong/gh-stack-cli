@@ -87,6 +87,9 @@ pub struct RepoInfo {
     pub git_dir: PathBuf,
     pub toplevel: PathBuf,
     pub current_branch: Option<String>,
+    /// Lowercased emails and names that count as "me": every `gt.me` value,
+    /// else `user.email` and `user.name`.
+    pub me: Vec<String>,
 }
 
 /// Opens the repository in-process (no git spawn).
@@ -103,7 +106,17 @@ pub fn repo_info(repo: &gix::Repository) -> Result<RepoInfo> {
         current_branch: repo
             .head_name()?
             .and_then(|n| n.as_bstr().to_string().strip_prefix("refs/heads/").map(str::to_string)),
+        me: identities(repo),
     })
+}
+
+fn identities(repo: &gix::Repository) -> Vec<String> {
+    let cfg = repo.config_snapshot();
+    let mut me: Vec<String> = cfg.plumbing().strings("gt.me").unwrap_or_default().iter().map(|v| v.to_string()).collect();
+    if me.is_empty() {
+        me = ["user.email", "user.name"].iter().filter_map(|k| cfg.string(*k)).map(|v| v.to_string()).collect();
+    }
+    me.into_iter().map(|v| v.trim().to_lowercase()).filter(|v| !v.is_empty()).collect()
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +126,8 @@ pub struct Commit {
     /// (stacked branches and trunks); other branches carry just their sha.
     pub parents: Vec<String>,
     pub subject: String,
+    pub author_name: String,
+    pub author_email: String,
 }
 
 /// Snapshot of every local branch and remote-tracking ref, read in-process.
@@ -129,11 +144,21 @@ impl Refs {
             let Ok(r) = r else { continue };
             let Some(id) = r.try_id() else { continue };
             let name = r.name().shorten().to_string();
-            let mut c = Commit { sha: id.to_string(), parents: vec![], subject: String::new() };
+            let mut c = Commit {
+                sha: id.to_string(),
+                parents: vec![],
+                subject: String::new(),
+                author_name: String::new(),
+                author_email: String::new(),
+            };
             if decode.contains(&name) {
                 if let Ok(commit) = repo.find_commit(id.detach()) {
                     c.parents = commit.parent_ids().map(|p| p.to_string()).collect();
                     c.subject = commit.message().map(|m| m.summary().to_string()).unwrap_or_default();
+                    if let Ok(a) = commit.author() {
+                        c.author_name = a.name.to_string();
+                        c.author_email = a.email.to_string();
+                    }
                 }
             }
             heads.insert(name, c);
