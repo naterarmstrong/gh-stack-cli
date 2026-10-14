@@ -89,60 +89,107 @@ fn local_badges(ctx: &Ctx, stack: &Stack, idx: usize) -> Vec<String> {
     out
 }
 
-fn render_stack(ctx: &Ctx, stack: &Stack, prs: &HashMap<String, Pr>) {
-    let cur = ctx.info.current_branch.as_deref();
-    let width = stack.branches.iter().map(|b| b.branch.len()).max().unwrap_or(0).max(stack.trunk.branch.len());
-    if stack.number > 0 {
-        println!("{}", ui::dim(&format!("stack #{}", stack.number)));
+/// One branch line's text after the graph column: name, PR, badges, and (in
+/// detail mode) the commit subject.
+struct Cols {
+    width: usize,
+    /// Reserve a PR-number column (only when some branch in the group has a PR).
+    pr: bool,
+    detail: bool,
+}
+
+fn branch_line(ctx: &Ctx, stack: &Stack, idx: usize, prs: &HashMap<String, Pr>, cols: &Cols) -> String {
+    let width = cols.width;
+    let b = &stack.branches[idx];
+    let here = ctx.info.current_branch.as_deref() == Some(&b.branch);
+    let name = format!("{:width$}", b.branch);
+    let name = if here {
+        ui::bold(&ui::cyan(&name))
+    } else if b.merged() {
+        ui::dim(&name)
+    } else {
+        name
+    };
+    let pr = prs.get(&b.branch);
+    let num = match pr.map(|p| p.number).or(b.pr_number()) {
+        Some(n) => {
+            let url = pr.map(|p| p.url.clone()).filter(|u| !u.is_empty()).unwrap_or_else(|| {
+                b.pull_request.as_ref().map(|p| p.url.clone()).unwrap_or_default()
+            });
+            ui::link(&url, &format!("#{n:<6}"))
+        }
+        None if cols.pr => format!("{:7}", ""),
+        None => String::new(),
+    };
+    let mut badges = vec![];
+    if b.merged() {
+        badges.push(ui::magenta("merged"));
+    } else {
+        badges.extend(local_badges(ctx, stack, idx));
+        if let Some(p) = pr {
+            badges.extend(pr_badges(p));
+        }
     }
-    for (idx, b) in stack.branches.iter().enumerate().rev() {
-        let here = cur == Some(&b.branch);
-        let marker = if b.merged() {
-            ui::dim("◌")
-        } else if here {
-            ui::cyan("◉")
-        } else {
-            "◯".to_string()
+    let num = if num.is_empty() { num } else { format!("{num} ") };
+    let mut line = format!("{name}  {num}{}", badges.join(&ui::dim(" · ")));
+    if cols.detail && !b.merged() {
+        if let Some(c) = ctx.refs.heads.get(&b.branch) {
+            line += &format!("  {}", ui::dim(&c.subject));
+        }
+    }
+    line.trim_end().to_string()
+}
+
+/// Draws stacks Graphite-style: each stack sharing a trunk gets its own
+/// column, and the columns fan back into the trunk on the last line.
+///
+/// ```text
+/// ◯    feat-b
+/// ◉    feat-a
+/// │ ◯  fix-top
+/// │ ◯  fix-bottom
+/// ◯─┘  main
+/// ```
+fn render_stacks(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bool) {
+    let cur = ctx.info.current_branch.as_deref();
+    let mut groups: Vec<(&str, Vec<&Stack>)> = vec![];
+    for &si in sis {
+        let s = &ctx.store.file.stacks[si];
+        match groups.iter_mut().find(|(t, _)| *t == s.trunk.branch) {
+            Some((_, g)) => g.push(s),
+            None => groups.push((&s.trunk.branch, vec![s])),
+        }
+    }
+    for (n, (trunk, stacks)) in groups.iter().enumerate() {
+        if n > 0 {
+            println!();
+        }
+        let cols = stacks.len();
+        let branches = || stacks.iter().flat_map(|s| &s.branches);
+        let layout = Cols {
+            width: branches().map(|b| b.branch.len()).max().unwrap_or(0),
+            pr: branches().any(|b| prs.contains_key(&b.branch) || b.pr_number().is_some()),
+            detail,
         };
-        let name = format!("{:width$}", b.branch);
-        let name = if here {
-            ui::bold(&ui::cyan(&name))
-        } else if b.merged() {
-            ui::dim(&name)
-        } else {
-            name
-        };
-        let pr = prs.get(&b.branch);
-        let num = pr.map(|p| p.number).or(b.pr_number());
-        let num = match num {
-            Some(n) => {
-                let url = pr.map(|p| p.url.clone()).filter(|u| !u.is_empty()).unwrap_or_else(|| {
-                    b.pull_request.as_ref().map(|p| p.url.clone()).unwrap_or_default()
-                });
-                ui::link(&url, &format!("#{n:<6}"))
-            }
-            None => ui::dim(&format!("{:7}", "no PR")),
-        };
-        let mut badges = vec![];
-        if b.merged() {
-            badges.push(ui::magenta("merged"));
-        } else {
-            badges.extend(local_badges(ctx, stack, idx));
-            if let Some(p) = pr {
-                badges.extend(pr_badges(p));
+        for (col, stack) in stacks.iter().enumerate() {
+            let rails = ui::dim(&"│ ".repeat(col));
+            let pad = "  ".repeat(cols - col - 1);
+            for (idx, b) in stack.branches.iter().enumerate().rev() {
+                let marker = if b.merged() {
+                    ui::dim("◌")
+                } else if cur == Some(&b.branch) {
+                    ui::cyan("◉")
+                } else {
+                    "◯".to_string()
+                };
+                println!("{rails}{marker} {pad} {}", branch_line(ctx, stack, idx, prs, &layout));
             }
         }
-        let subject = if b.merged() {
-            String::new()
-        } else {
-            ctx.refs.heads.get(&b.branch).map(|c| ui::dim(&c.subject)).unwrap_or_default()
-        };
-        println!("{marker} {name}  {num} {}  {subject}", badges.join(&ui::dim(" · ")));
-        println!("{}", ui::dim("│"));
+        let marker = if cur == Some(*trunk) { ui::cyan("◉") } else { "◯".to_string() };
+        let fan = (1..cols).map(|c| if c == cols - 1 { "─┘" } else { "─┴" }).collect::<String>();
+        let name = if cur == Some(*trunk) { ui::bold(&ui::cyan(trunk)) } else { ui::dim(trunk) };
+        println!("{marker}{}  {name}", ui::dim(&fan));
     }
-    let trunk_here = cur == Some(stack.trunk.branch.as_str());
-    let trunk_marker = if trunk_here { ui::cyan("◉") } else { "◯".to_string() };
-    println!("{trunk_marker} {}", ui::dim(&stack.trunk.branch));
 }
 
 fn stacks_to_show(ctx: &Ctx, all: bool) -> Vec<usize> {
@@ -176,9 +223,9 @@ fn fetch_prs(ctx: &Ctx, sis: &[usize], include_merged: bool) -> Result<(String, 
     Ok((repo_id, map))
 }
 
-pub fn log(all: bool, offline: bool) -> Result<()> {
+pub fn log(stack_only: bool, offline: bool) -> Result<()> {
     let ctx = Ctx::new(false)?;
-    let sis = stacks_to_show(&ctx, all);
+    let sis = stacks_to_show(&ctx, !stack_only);
     if sis.is_empty() {
         println!("No stacks. Start one with `gt create <name> -m <message>`.");
         return Ok(());
@@ -194,12 +241,7 @@ pub fn log(all: bool, offline: bool) -> Result<()> {
             }
         }
     };
-    for (n, &si) in sis.iter().enumerate() {
-        if n > 0 {
-            println!();
-        }
-        render_stack(&ctx, &ctx.store.file.stacks[si], &prs);
-    }
+    render_stacks(&ctx, &sis, &prs, !offline);
     Ok(())
 }
 
@@ -585,9 +627,20 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         bail!("nothing to sync");
     }
 
+    // Merged branches are pruned from every stack, not just the ones being synced.
+    let prune_sis: Vec<usize> = if opts.no_prune {
+        vec![]
+    } else {
+        (0..ctx.store.file.stacks.len())
+            .filter(|&si| ctx.store.file.stacks[si].branches.iter().any(|b| ctx.refs.heads.contains_key(&b.branch)))
+            .collect()
+    };
+    let mut pr_sis = sis.clone();
+    pr_sis.extend(prune_sis.iter().filter(|si| !sis.contains(si)));
+
     // 1. One GraphQL round trip for every PR: learn numbers and what merged.
-    let prs = if opts.offline { HashMap::new() } else { fetch_prs(&ctx, &sis, true)?.1 };
-    for &si in &sis {
+    let prs = if opts.offline { HashMap::new() } else { fetch_prs(&ctx, &pr_sis, true)?.1 };
+    for &si in &pr_sis {
         for b in ctx.store.file.stacks[si].branches.iter_mut() {
             let Some(pr) = prs.get(&b.branch) else { continue };
             let r = b.pull_request.get_or_insert_with(PrRef::default);
@@ -628,7 +681,12 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
     }
     ctx.reload()?;
 
-    // 3. Pull in commits others pushed to our branches.
+    // 3. Delete local branches whose PRs merged, as long as the local head is
+    // exactly what was merged. Done before restacking so a stack that can't be
+    // restacked still gets cleaned up.
+    prune(&mut ctx, &prune_sis, &prs)?;
+
+    // 4. Pull in commits others pushed to our branches.
     for &si in &sis {
         let s = ctx.store.file.stacks[si].clone();
         for (idx, b) in s.active() {
@@ -659,7 +717,7 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
     }
     ctx.reload()?;
 
-    // 4. Fast-forward local trunks nobody has checked out.
+    // 5. Fast-forward local trunks nobody has checked out.
     for &si in &sis {
         let trunk = ctx.store.file.stacks[si].trunk.branch.clone();
         if let (Some(l), Some(r)) = (ctx.refs.head(&trunk), ctx.refs.remote.get(&trunk)) {
@@ -669,17 +727,26 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         }
     }
 
-    // 5. Restack every stack onto its updated trunk.
+    // 6. Restack every stack onto its updated trunk. A stack that can't be
+    // restacked (e.g. multi-commit branches) is skipped, not fatal.
+    let mut restacked = vec![];
     for &si in &sis {
-        if !restack::run(&mut ctx, si, true)? {
-            ctx.save()?;
-            std::process::exit(1);
+        if ctx.store.file.stacks[si].fully_merged() {
+            continue;
+        }
+        match restack::run(&mut ctx, si, true) {
+            Ok(true) => restacked.push(si),
+            Ok(false) => {
+                ctx.save()?;
+                std::process::exit(1);
+            }
+            Err(e) => ui::warn(&format!("not restacking or pushing the stack on {}: {e:#}", ctx.store.file.stacks[si].trunk.branch)),
         }
     }
 
-    // 6. Push branches that already have a remote copy.
+    // 7. Push branches that already have a remote copy.
     if !opts.no_push {
-        for &si in &sis {
+        for &si in &restacked {
             let branches: Vec<String> =
                 needs_push(&ctx, si).into_iter().filter(|b| ctx.refs.remote.contains_key(b)).collect();
             push(&ctx, &branches, opts.no_verify)?;
@@ -687,24 +754,13 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         ctx.reload()?;
     }
 
-    // 7. Delete local branches whose PRs merged, unless they hold unpushed work.
-    if !opts.no_prune {
-        prune(&mut ctx, &sis, &prs)?;
-    }
-
     restack::record_heads(&mut ctx);
     ctx.save()?;
-    for (n, &si) in sis.iter().enumerate() {
-        if n > 0 {
-            println!();
-        }
-        let s = &ctx.store.file.stacks[si];
-        if s.fully_merged() {
-            ui::ok(&format!("stack on {} is fully merged", s.trunk.branch));
-        } else {
-            render_stack(&ctx, s, &prs);
-        }
+    let (done, live): (Vec<usize>, Vec<usize>) = sis.iter().partition(|&&si| ctx.store.file.stacks[si].fully_merged());
+    for si in done {
+        ui::ok(&format!("stack on {} is fully merged", ctx.store.file.stacks[si].trunk.branch));
     }
+    render_stacks(&ctx, &live, &prs, true);
     Ok(())
 }
 
@@ -713,39 +769,68 @@ fn prune(ctx: &mut Ctx, sis: &[usize], prs: &HashMap<String, Pr>) -> Result<()> 
         let s = ctx.store.file.stacks[si].clone();
         for (idx, b) in s.branches.iter().enumerate().filter(|(_, b)| b.merged()) {
             let Some(local) = ctx.refs.head(&b.branch).map(str::to_string) else { continue };
-            let safe = match prs.get(&b.branch) {
-                Some(pr) => pr.head_ref_oid == local,
-                None => ctx.refs.remote.get(&b.branch) == Some(&local),
+            // Only delete when the local head is exactly the commit GitHub merged.
+            let merged_head = match prs.get(&b.branch) {
+                Some(pr) => Some(pr.head_ref_oid.as_str()),
+                None => ctx.refs.remote.get(&b.branch).map(String::as_str),
             };
-            if !safe {
-                ui::warn(&format!("{} merged but has local commits that weren't in the PR; keeping it", b.branch));
-                continue;
+            match merged_head {
+                Some(h) if h == local => {}
+                Some(h) => {
+                    ui::warn(&format!(
+                        "{} merged at {}, but the local branch is at {}; keeping it",
+                        b.branch,
+                        ui::short(h),
+                        ui::short(&local)
+                    ));
+                    continue;
+                }
+                None => {
+                    ui::warn(&format!("{} merged, but can't confirm what was merged (offline?); keeping it", b.branch));
+                    continue;
+                }
             }
             if let Some(wt) = ctx.other_worktree(&b.branch) {
                 ui::info(&format!("{} merged; not deleting it, it's checked out in {}", b.branch, wt.display()));
                 continue;
             }
-            if ctx.info.current_branch.as_deref() == Some(&b.branch) {
-                let next = s.branches[idx + 1..]
-                    .iter()
-                    .find(|x| !x.merged() && !ctx.worktrees.contains_key(&x.branch))
-                    .map(|x| x.branch.clone());
-                let Some(next) = next else {
-                    ui::info(&format!("{} merged; staying on it (nowhere to move)", b.branch));
-                    continue;
-                };
-                if !git::run_raw(None, &["checkout", "--quiet", &next], None, &[])?.ok {
-                    ui::info(&format!("{} merged; couldn't switch away to delete it", b.branch));
-                    continue;
-                }
-                ui::info(&format!("moved to {}", ui::bold(&next)));
-                ctx.reload()?;
+            if ctx.info.current_branch.as_deref() == Some(&b.branch) && !leave_merged(ctx, &s, idx)? {
+                continue;
             }
             git::run(&["branch", "--quiet", "-D", &b.branch])?;
             ui::ok(&format!("deleted merged branch {}", b.branch));
         }
     }
     ctx.reload()
+}
+
+/// Moves this worktree off a merged branch: to the next unmerged branch in the
+/// stack, else the trunk, else (trunk checked out elsewhere) a detached remote trunk.
+fn leave_merged(ctx: &mut Ctx, s: &Stack, idx: usize) -> Result<bool> {
+    let b = &s.branches[idx].branch;
+    let next = s.branches[idx + 1..]
+        .iter()
+        .find(|x| !x.merged() && ctx.refs.heads.contains_key(&x.branch) && !ctx.worktrees.contains_key(&x.branch))
+        .map(|x| x.branch.clone());
+    let trunk = &s.trunk.branch;
+    let (args, dest): (Vec<String>, String) = match next {
+        Some(n) => (vec!["checkout".into(), "--quiet".into(), n.clone()], n),
+        None if !ctx.worktrees.contains_key(trunk) && ctx.refs.heads.contains_key(trunk) => {
+            (vec!["checkout".into(), "--quiet".into(), trunk.clone()], trunk.clone())
+        }
+        None => {
+            let tip = ctx.trunk_tip(trunk)?;
+            (vec!["checkout".into(), "--quiet".into(), "--detach".into(), tip.clone()], format!("{} (detached)", ctx.remote_ref(trunk).trim_start_matches("refs/remotes/")))
+        }
+    };
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    if !git::run_raw(None, &args, None, &[])?.ok {
+        ui::info(&format!("{b} merged; couldn't switch away to delete it (local changes?)"));
+        return Ok(false);
+    }
+    ui::info(&format!("moved to {}", ui::bold(&dest)));
+    ctx.reload()?;
+    Ok(true)
 }
 
 // ───────────────────────────── submit ─────────────────────────────

@@ -277,6 +277,9 @@ pub fn rebase_in_progress(git_dir: &Path) -> bool {
     git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists()
 }
 
-pub fn remote_url(remote: &str) -> Result<String> {
-    run(&["remote", "get-url", remote])
+/// Candidate URLs for a remote: as configured, then with `insteadOf` rewrites applied.
+pub fn remote_urls(remote: &str) -> Vec<String> {
+    let raw = run(&["config", "--get", &format!("remote.{remote}.url")]).ok();
+    let expanded = run(&["remote", "get-url", remote]).ok();
+    raw.into_iter().chain(expanded).collect()
 }

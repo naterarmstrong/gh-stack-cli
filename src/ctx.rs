@@ -45,7 +45,13 @@ impl Ctx {
         if let Some(c) = self.gh.get() {
             return Ok(c);
         }
-        let client = Client::new(&git::remote_url(&self.remote)?)?;
+        let urls = git::remote_urls(&self.remote);
+        let url = urls
+            .iter()
+            .find(|u| crate::github::parse_remote(u).is_some())
+            .or(urls.first())
+            .ok_or_else(|| anyhow!("no remote named {}", self.remote))?;
+        let client = Client::new(url)?;
         Ok(self.gh.get_or_init(|| client))
     }
 
@@ -73,7 +79,7 @@ impl Ctx {
         self.store
             .file
             .find(cur)
-            .ok_or_else(|| anyhow!("{cur} is not part of a stack (see `gt ls --all`, `gt track`)"))
+            .ok_or_else(|| anyhow!("{cur} is not part of a stack (see `gt ls`, `gt track`)"))
     }
 
     pub fn remote_ref(&self, branch: &str) -> String {
@@ -121,11 +127,12 @@ impl Ctx {
     }
 
     /// Which PR query to use for each branch in a stack (by number when known, else by head).
+    /// `include_merged` adds merged branches that still exist locally (prune candidates).
     pub fn pr_queries(&self, si: usize, include_merged: bool) -> Vec<(String, PrQuery)> {
         self.store.file.stacks[si]
             .branches
             .iter()
-            .filter(|b| include_merged || !b.merged())
+            .filter(|b| !b.merged() || (include_merged && self.refs.heads.contains_key(&b.branch)))
             .map(|b| {
                 let q = match b.pr_number() {
                     Some(n) => PrQuery::Number(n),

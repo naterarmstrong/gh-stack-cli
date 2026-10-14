@@ -20,17 +20,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Show the current stack with PR, CI and review status
+    /// Show every local stack with PR, CI and review status
     #[command(visible_alias = "l")]
     Log {
-        /// Show every stack, not just the current one
+        /// Only the stack containing the current branch
         #[arg(short, long)]
-        all: bool,
+        stack: bool,
     },
-    /// Show the current stack from local state only (no network)
+    /// Show every local stack, compactly, from local state only (no network)
     Ls {
         #[arg(short, long)]
-        all: bool,
+        stack: bool,
     },
     /// Check out the branch above
     #[command(visible_alias = "u")]
@@ -128,8 +128,8 @@ enum Cmd {
 fn main() {
     let cli = Cli::parse();
     let res = match cli.cmd {
-        Cmd::Log { all } => commands::log(all, false),
-        Cmd::Ls { all } => commands::log(all, true),
+        Cmd::Log { stack } => commands::log(stack, false),
+        Cmd::Ls { stack } => commands::log(stack, true),
         Cmd::Up { steps } => commands::nav(Nav::Up(steps.unwrap_or(1))),
         Cmd::Down { steps } => commands::nav(Nav::Down(steps.unwrap_or(1))),
         Cmd::Top => commands::nav(Nav::Top),

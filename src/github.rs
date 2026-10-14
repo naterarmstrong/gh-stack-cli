@@ -104,7 +104,11 @@ impl Client {
     pub fn new(remote_url: &str) -> Result<Client> {
         let (host, owner, repo) =
             parse_remote(remote_url).ok_or_else(|| anyhow!("can't parse GitHub remote url {remote_url}"))?;
-        let api = if host == "github.com" { "https://api.github.com".into() } else { format!("https://{host}/api/v3") };
+        let api = match std::env::var("GT_GITHUB_API") {
+            Ok(a) if !a.is_empty() => a,
+            _ if host == "github.com" => "https://api.github.com".into(),
+            _ => format!("https://{host}/api/v3"),
+        };
         Ok(Client {
             agent: ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build(),
             token: token(&host)?,
