@@ -136,6 +136,9 @@ enum Cmd {
         /// Don't ask for confirmation
         #[arg(short, long)]
         force: bool,
+        /// Also delete branches whose local commit differs from what merged
+        #[arg(short = 'D', long)]
+        include_diverged: bool,
     },
     /// Open a branch's PR in the browser
     #[command(visible_alias = "pr")]
@@ -165,7 +168,7 @@ fn main() {
         Cmd::Get { target } => commands::get(target),
         Cmd::Track { branches, trunk } => commands::track(branches, trunk),
         Cmd::Delete { target, force } => commands::delete_upstack(target, force),
-        Cmd::ClearMerged { force } => commands::clear_merged(force),
+        Cmd::ClearMerged { force, include_diverged } => commands::clear_merged(force, include_diverged),
         Cmd::Open { target } => commands::open(target),
     };
     if let Err(e) = res {

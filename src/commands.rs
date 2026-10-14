@@ -231,11 +231,13 @@ fn stacks_to_show(ctx: &Ctx, all: bool) -> Vec<usize> {
 }
 
 fn fetch_prs(ctx: &Ctx, sis: &[usize], include_merged: bool) -> Result<(String, HashMap<String, Pr>)> {
-    query_prs(ctx, sis.iter().flat_map(|&si| ctx.pr_queries(si, include_merged)).collect())
+    query_prs(ctx, sis.iter().flat_map(|&si| ctx.pr_queries(si, include_merged)).collect(), true)
 }
 
-/// Looks up PRs for (branch, query) pairs, 50 per GraphQL request.
-fn query_prs(ctx: &Ctx, queries: Vec<(String, PrQuery)>) -> Result<(String, HashMap<String, Pr>)> {
+/// Looks up PRs for (branch, query) pairs, 50 per GraphQL request. With
+/// `strict`, a closed or merged PR found by branch name only counts if it
+/// points at a commit the branch has (the name may have been reused).
+fn query_prs(ctx: &Ctx, queries: Vec<(String, PrQuery)>, strict: bool) -> Result<(String, HashMap<String, Pr>)> {
     if queries.is_empty() {
         return Ok((String::new(), HashMap::new()));
     }
@@ -252,7 +254,7 @@ fn query_prs(ctx: &Ctx, queries: Vec<(String, PrQuery)>) -> Result<(String, Hash
         let Some(pr) = pr else { continue };
         // A head lookup can find an old PR from a reused branch name; only
         // trust a non-open one if it points at a commit we actually have.
-        if matches!(q, PrQuery::Head(_)) && pr.state != "OPEN" {
+        if strict && matches!(q, PrQuery::Head(_)) && pr.state != "OPEN" {
             let ours = ctx.refs.head(&name) == Some(&pr.head_ref_oid)
                 || ctx.refs.remote.get(&name) == Some(&pr.head_ref_oid);
             if !ours {
@@ -957,8 +959,9 @@ fn leave_branch(ctx: &mut Ctx, b: &str, next: Option<String>, trunk: &str) -> Re
 }
 
 /// Deletes every local branch, stacked or not, whose PR merged with exactly
-/// the commit the branch points at. Remote branches are left alone.
-pub fn clear_merged(force: bool) -> Result<()> {
+/// the commit the branch points at (or any commit, with `diverged`).
+/// Remote branches are left alone.
+pub fn clear_merged(force: bool, diverged: bool) -> Result<()> {
     let mut ctx = Ctx::new(true)?;
     let default_trunk = ctx.default_trunk();
     let mut trunks: std::collections::HashSet<String> =
@@ -977,10 +980,11 @@ pub fn clear_merged(force: bool) -> Result<()> {
     untracked.sort();
     queries.extend(untracked.iter().map(|b| (b.clone(), PrQuery::Head(b.clone()))));
     let n_checked = queries.iter().filter(|(b, _)| ctx.refs.heads.contains_key(b)).count();
-    let prs = query_prs(&ctx, queries)?.1;
+    let prs = query_prs(&ctx, queries, !diverged)?.1;
     record_prs(&mut ctx, &all, &prs);
 
-    let mut doomed: Vec<(String, String, u64)> = vec![];
+    // (branch, local head, PR number, note about local commits the PR didn't have)
+    let mut doomed: Vec<(String, String, u64, Option<String>)> = vec![];
     let mut names: Vec<&String> = prs.keys().collect();
     names.sort();
     for name in names {
@@ -989,20 +993,22 @@ pub fn clear_merged(force: bool) -> Result<()> {
         if pr.state != "MERGED" {
             continue;
         }
-        if pr.head_ref_oid != local {
-            ui::warn(&format!(
-                "{name}: #{} merged at {}, but the local branch is at {}; keeping it",
-                pr.number,
-                ui::short(&pr.head_ref_oid),
-                ui::short(local)
-            ));
+        let note = (pr.head_ref_oid != local).then(|| {
+            let extra = git::rev_parse(&pr.head_ref_oid)
+                .and_then(|m| git::own_commits(local, &[m]).ok())
+                .map(|c| format!("{} local commit(s) not in the PR", c.len()))
+                .unwrap_or_else(|| "unrelated to what merged".into());
+            format!("local {} ≠ merged {}: {extra}", ui::short(local), ui::short(&pr.head_ref_oid))
+        });
+        if let (Some(n), false) = (&note, diverged) {
+            ui::warn(&format!("{name}: #{} merged, but {n}; keeping it (--include-diverged deletes it)", pr.number));
             continue;
         }
         if let Some(wt) = ctx.other_worktree(name) {
             ui::info(&format!("{name}: #{} merged; skipping, it's checked out in {}", pr.number, wt.display()));
             continue;
         }
-        doomed.push((name.clone(), local.to_string(), pr.number));
+        doomed.push((name.clone(), local.to_string(), pr.number, note));
     }
     if doomed.is_empty() {
         ui::ok(&format!("no merged branches to delete ({n_checked} checked)"));
@@ -1010,8 +1016,9 @@ pub fn clear_merged(force: bool) -> Result<()> {
         return ctx.save();
     }
     eprintln!("Deleting {} merged local branch(es); remote branches stay as they are:", doomed.len());
-    for (b, h, n) in &doomed {
-        eprintln!("  {} {} {}", ui::bold(b), ui::dim(ui::short(h)), ui::magenta(&format!("#{n} merged")));
+    for (b, h, n, note) in &doomed {
+        let note = note.as_ref().map(|n| format!("  {}", ui::yellow(n))).unwrap_or_default();
+        eprintln!("  {} {} {}{note}", ui::bold(b), ui::dim(ui::short(h)), ui::magenta(&format!("#{n} merged")));
     }
     if !force && !picker::confirm("Delete them?")? {
         restack::record_heads(&mut ctx);
@@ -1019,7 +1026,7 @@ pub fn clear_merged(force: bool) -> Result<()> {
         bail!("aborted; nothing deleted");
     }
 
-    for (b, h, _) in &doomed {
+    for (b, h, _, _) in &doomed {
         if ctx.info.current_branch.as_deref() == Some(b) {
             let moved = match ctx.store.file.find(b) {
                 Some(si) => {
