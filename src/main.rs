@@ -2,6 +2,7 @@ mod commands;
 mod ctx;
 mod git;
 mod github;
+mod picker;
 mod restack;
 mod state;
 mod ui;
@@ -46,7 +47,7 @@ enum Cmd {
     Bottom,
     /// Check out the stack's trunk
     Trunk,
-    /// Check out a branch by name or PR number (picker if omitted)
+    /// Check out a branch by name or PR number (interactive picker if omitted)
     #[command(visible_alias = "co")]
     Checkout { target: Option<String> },
     /// Create a branch above the current one and commit staged changes to it
@@ -120,6 +121,15 @@ enum Cmd {
         #[arg(long)]
         trunk: Option<String>,
     },
+    /// Delete a branch and everything above it in its stack, locally only (picker if omitted)
+    #[command(visible_alias = "dl")]
+    Delete {
+        /// Lowest branch to delete (name or PR number)
+        target: Option<String>,
+        /// Don't ask for confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Open a branch's PR in the browser
     #[command(visible_alias = "pr")]
     Open { target: Option<String> },
@@ -147,6 +157,7 @@ fn main() {
         Cmd::Submit { draft, no_verify, relink } => commands::submit(draft, no_verify, relink),
         Cmd::Get { target } => commands::get(target),
         Cmd::Track { branches, trunk } => commands::track(branches, trunk),
+        Cmd::Delete { target, force } => commands::delete_upstack(target, force),
         Cmd::Open { target } => commands::open(target),
     };
     if let Err(e) = res {

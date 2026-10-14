@@ -1,12 +1,12 @@
 use crate::ctx::Ctx;
 use crate::git;
+use crate::picker;
 use crate::github::{MutationBatch, Pr, PrQuery};
 use crate::restack;
 use crate::state::{BranchRef, PrRef, Stack};
 use crate::ui;
 use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
 
 // ───────────────────────────── log ─────────────────────────────
 
@@ -121,7 +121,7 @@ fn branch_line(ctx: &Ctx, stack: &Stack, idx: usize, prs: &HashMap<String, Pr>, 
         None if cols.pr => format!("{:7}", ""),
         None => String::new(),
     };
-    let mut badges = vec![];
+    let mut badges: Vec<String> = worktree_badge(ctx, &b.branch).into_iter().collect();
     if b.merged() {
         badges.push(ui::magenta("merged"));
     } else {
@@ -151,7 +151,28 @@ fn branch_line(ctx: &Ctx, stack: &Stack, idx: usize, prs: &HashMap<String, Pr>, 
 /// ◯─┘  main
 /// ```
 fn render_stacks(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bool) {
+    for row in graph_rows(ctx, sis, prs, detail) {
+        println!("{}", row.text);
+    }
+}
+
+/// Dim "in <worktree>" badge for a branch checked out in another worktree.
+fn worktree_badge(ctx: &Ctx, branch: &str) -> Option<String> {
+    let wt = ctx.other_worktree(branch)?;
+    Some(ui::dim(&format!("in {}", wt.file_name().map(|n| n.to_string_lossy()).unwrap_or_default())))
+}
+
+struct Row {
+    text: String,
+    /// The branch on this line, unless it's merged or missing locally.
+    branch: Option<String>,
+    is_trunk: bool,
+}
+
+/// The graph as lines, bottom stack last, trunk at the bottom of each group.
+fn graph_rows(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bool) -> Vec<Row> {
     let cur = ctx.info.current_branch.as_deref();
+    let mut rows = vec![];
     let mut groups: Vec<(&str, Vec<&Stack>)> = vec![];
     for &si in sis {
         let s = &ctx.store.file.stacks[si];
@@ -162,7 +183,7 @@ fn render_stacks(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bo
     }
     for (n, (trunk, stacks)) in groups.iter().enumerate() {
         if n > 0 {
-            println!();
+            rows.push(Row { text: String::new(), branch: None, is_trunk: false });
         }
         let cols = stacks.len();
         let branches = || stacks.iter().flat_map(|s| &s.branches);
@@ -182,14 +203,24 @@ fn render_stacks(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bo
                 } else {
                     "◯".to_string()
                 };
-                println!("{rails}{marker} {pad} {}", branch_line(ctx, stack, idx, prs, &layout));
+                rows.push(Row {
+                    text: format!("{rails}{marker} {pad} {}", branch_line(ctx, stack, idx, prs, &layout)),
+                    branch: (!b.merged() && ctx.refs.heads.contains_key(&b.branch)).then(|| b.branch.clone()),
+                    is_trunk: false,
+                });
             }
         }
         let marker = if cur == Some(*trunk) { ui::cyan("◉") } else { "◯".to_string() };
         let fan = (1..cols).map(|c| if c == cols - 1 { "─┘" } else { "─┴" }).collect::<String>();
         let name = if cur == Some(*trunk) { ui::bold(&ui::cyan(trunk)) } else { ui::dim(trunk) };
-        println!("{marker}{}  {name}", ui::dim(&fan));
+        let wt = worktree_badge(ctx, trunk).map(|w| format!("  {w}")).unwrap_or_default();
+        rows.push(Row {
+            text: format!("{marker}{}  {name}{wt}", ui::dim(&fan)),
+            branch: ctx.refs.heads.contains_key(*trunk).then(|| trunk.to_string()),
+            is_trunk: true,
+        });
     }
+    rows
 }
 
 fn stacks_to_show(ctx: &Ctx, all: bool) -> Vec<usize> {
@@ -308,46 +339,38 @@ fn parse_pr(target: &str) -> Option<u64> {
 pub fn checkout_cmd(target: Option<String>) -> Result<()> {
     let ctx = Ctx::new(false)?;
     let branch = match target {
-        Some(t) => {
-            if ctx.refs.heads.contains_key(&t) {
-                t
-            } else if let Some((si, bi)) = parse_pr(&t).and_then(|n| ctx.store.file.find_pr(n)) {
-                let b = &ctx.store.file.stacks[si].branches[bi];
-                if b.merged() {
-                    bail!("#{} ({}) is already merged", b.pr_number().unwrap(), b.branch);
-                }
-                b.branch.clone()
-            } else {
-                bail!("no local branch or tracked PR matches {t} (use `gt get {t}` to pull it down)");
-            }
+        Some(t) => resolve_branch(&ctx, &t)?,
+        None => {
+            let sis = stacks_to_show(&ctx, true);
+            pick_branch(&ctx, "checkout", &sis, |r| r.branch.as_ref().is_some_and(|b| ctx.other_worktree(b).is_none()))?
         }
-        None => pick_branch(&ctx)?,
     };
     checkout(&ctx, &branch)
 }
 
-fn pick_branch(ctx: &Ctx) -> Result<String> {
-    let mut choices = vec![];
-    for si in stacks_to_show(ctx, true) {
-        let s = &ctx.store.file.stacks[si];
-        for (_, b) in s.active().collect::<Vec<_>>().into_iter().rev() {
-            choices.push(b.branch.clone());
+/// Interactive branch picker over the `gt ls` graph, starting on the current branch.
+/// `selectable` decides which lines can be picked.
+fn pick_branch(ctx: &Ctx, prompt: &str, sis: &[usize], selectable: impl Fn(&Row) -> bool) -> Result<String> {
+    let rows: Vec<picker::Item> = graph_rows(ctx, sis, &HashMap::new(), false)
+        .into_iter()
+        .map(|r| picker::Item { key: r.branch.clone().filter(|_| selectable(&r)), text: r.text })
+        .collect();
+    picker::pick(prompt, &rows, ctx.info.current_branch.as_deref())?.ok_or_else(|| anyhow!("cancelled"))
+}
+
+/// Resolves a branch name or PR number (`123`, `#123`, or a PR URL) to a tracked or local branch.
+fn resolve_branch(ctx: &Ctx, t: &str) -> Result<String> {
+    if ctx.refs.heads.contains_key(t) {
+        return Ok(t.to_string());
+    }
+    if let Some((si, bi)) = parse_pr(t).and_then(|n| ctx.store.file.find_pr(n)) {
+        let b = &ctx.store.file.stacks[si].branches[bi];
+        if b.merged() {
+            bail!("#{} ({}) is already merged", b.pr_number().unwrap(), b.branch);
         }
+        return Ok(b.branch.clone());
     }
-    if choices.is_empty() {
-        bail!("no stacked branches");
-    }
-    for (i, c) in choices.iter().enumerate() {
-        let here = ctx.info.current_branch.as_deref() == Some(c);
-        let wt = ctx.other_worktree(c).map(|p| ui::dim(&format!("  ({})", p.display()))).unwrap_or_default();
-        eprintln!("{:>3}  {}{wt}", i + 1, if here { ui::cyan(c) } else { c.clone() });
-    }
-    eprint!("checkout #: ");
-    std::io::stderr().flush()?;
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
-    let n: usize = line.trim().parse().map_err(|_| anyhow!("not a number"))?;
-    choices.get(n.wrapping_sub(1)).cloned().ok_or_else(|| anyhow!("out of range"))
+    bail!("no local branch or tracked PR matches {t} (use `gt get {t}` to pull it down)")
 }
 
 // ───────────────────────────── create / modify ─────────────────────────────
@@ -541,6 +564,74 @@ pub fn track(branches: Vec<String>, trunk: Option<String>) -> Result<()> {
     ctx.save()?;
     ui::ok(&format!("tracking {} on {trunk}", branches.join(" ← ")));
     Ok(())
+}
+
+/// Deletes `target` and every branch above it in its stack, locally only:
+/// remote branches, PRs and the GitHub stack are left alone.
+pub fn delete_upstack(target: Option<String>, force: bool) -> Result<()> {
+    let mut ctx = Ctx::new(true)?;
+    let from = match target {
+        Some(t) => resolve_branch(&ctx, &t)?,
+        None => {
+            let sis = stacks_to_show(&ctx, true);
+            pick_branch(&ctx, "delete from (and everything above)", &sis, |r| r.branch.is_some() && !r.is_trunk)?
+        }
+    };
+    let si = ctx.store.file.find(&from).ok_or_else(|| anyhow!("{from} is not part of a stack"))?;
+    let stack = ctx.store.file.stacks[si].clone();
+    let idx = stack.index_of(&from).unwrap();
+    let doomed = &stack.branches[idx..];
+
+    let busy: Vec<String> = doomed
+        .iter()
+        .filter_map(|b| ctx.other_worktree(&b.branch).map(|wt| format!("{} ({})", b.branch, wt.display())))
+        .collect();
+    if !busy.is_empty() {
+        bail!("can't delete branches checked out in other worktrees: {}", busy.join(", "));
+    }
+
+    let local: Vec<(String, String)> =
+        doomed.iter().filter_map(|b| ctx.refs.head(&b.branch).map(|h| (b.branch.clone(), h.to_string()))).collect();
+    eprintln!("Deleting {} local branch(es); remote branches and PRs stay as they are:", local.len());
+    for (b, h) in local.iter().rev() {
+        let note = match ctx.refs.remote.get(b) {
+            None => ui::yellow("  never pushed"),
+            Some(r) if r != h => ui::yellow("  has unpushed changes"),
+            _ => String::new(),
+        };
+        eprintln!("  {} {}{note}", ui::bold(b), ui::dim(ui::short(h)));
+    }
+    if !force && !picker::confirm("Delete them?")? {
+        bail!("aborted; nothing deleted");
+    }
+
+    // Step off the doomed branches first, onto whatever they were stacked on.
+    if ctx.info.current_branch.as_deref().is_some_and(|c| doomed.iter().any(|b| b.branch == c)) {
+        let dest = stack.parent_of(idx).to_string();
+        let free = ctx.refs.heads.contains_key(&dest) && ctx.other_worktree(&dest).is_none();
+        let (args, label) = if free {
+            (vec!["checkout".to_string(), "--quiet".into(), dest.clone()], dest.clone())
+        } else {
+            let tip = if dest == stack.trunk.branch { ctx.trunk_tip(&dest)? } else { ctx.refs.head(&dest).unwrap_or_default().to_string() };
+            (vec!["checkout".to_string(), "--quiet".into(), "--detach".into(), tip.clone()], format!("{dest} (detached at {})", ui::short(&tip)))
+        };
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = git::run_raw(None, &args, None, &[])?;
+        if !out.ok {
+            bail!("couldn't move off {from}; nothing deleted: {}", out.stderr.trim());
+        }
+        ui::info(&format!("moved to {}", ui::bold(&label)));
+    }
+
+    for (b, h) in local.iter().rev() {
+        git::run(&["branch", "--quiet", "-D", b])?;
+        ui::ok(&format!("deleted {} {}", ui::bold(b), ui::dim(&format!("(was {})", ui::short(h)))));
+    }
+    ctx.store.file.stacks[si].branches.truncate(idx);
+    if ctx.store.file.stacks[si].branches.is_empty() {
+        ctx.store.file.stacks.remove(si);
+    }
+    ctx.save()
 }
 
 // ───────────────────────────── fetch / push helpers ─────────────────────────────
