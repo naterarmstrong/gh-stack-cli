@@ -130,6 +130,13 @@ enum Cmd {
         #[arg(short, long)]
         force: bool,
     },
+    /// Delete every local branch whose PR merged (only if the branch is exactly what merged)
+    #[command(name = "clear-merged", visible_alias = "cm")]
+    ClearMerged {
+        /// Don't ask for confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Open a branch's PR in the browser
     #[command(visible_alias = "pr")]
     Open { target: Option<String> },
@@ -158,6 +165,7 @@ fn main() {
         Cmd::Get { target } => commands::get(target),
         Cmd::Track { branches, trunk } => commands::track(branches, trunk),
         Cmd::Delete { target, force } => commands::delete_upstack(target, force),
+        Cmd::ClearMerged { force } => commands::clear_merged(force),
         Cmd::Open { target } => commands::open(target),
     };
     if let Err(e) = res {
