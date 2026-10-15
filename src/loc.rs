@@ -414,27 +414,32 @@ pub fn label(k: Kind) -> &'static str {
     }
 }
 
-/// `+120 −30 src  +300 test` as (plain, colored) so callers can pad on the plain width.
-pub fn summary(s: &Split) -> (String, String) {
+/// `+120 −30` as (plain, colored) so callers can pad on the plain width.
+pub fn counts(l: &Lines) -> (String, String) {
     use crate::ui;
-    let mut plain = vec![];
-    let mut color = vec![];
-    for (k, l) in s.iter().filter(|(_, l)| !l.is_empty()) {
-        let mut p = vec![];
-        let mut c = vec![];
-        if l.add > 0 {
-            p.push(format!("+{}", human(l.add)));
-            c.push(ui::green(&format!("+{}", human(l.add))));
-        }
-        if l.del > 0 {
-            p.push(format!("−{}", human(l.del)));
-            c.push(ui::red(&format!("−{}", human(l.del))));
-        }
-        p.push(label(k).to_string());
-        c.push(ui::dim(label(k)));
-        plain.push(p.join(" "));
-        color.push(c.join(" "));
+    let mut p = vec![];
+    let mut c = vec![];
+    if l.add > 0 {
+        p.push(format!("+{}", human(l.add)));
+        c.push(ui::green(&format!("+{}", human(l.add))));
     }
+    if l.del > 0 {
+        p.push(format!("−{}", human(l.del)));
+        c.push(ui::red(&format!("−{}", human(l.del))));
+    }
+    (p.join(" "), c.join(" "))
+}
+
+/// `+120 −30 src  +300 test` as (plain, colored).
+pub fn summary(s: &Split) -> (String, String) {
+    let (plain, color): (Vec<_>, Vec<_>) = s
+        .iter()
+        .filter(|(_, l)| !l.is_empty())
+        .map(|(k, l)| {
+            let (p, c) = counts(&l);
+            (format!("{p} {}", label(k)), format!("{c} {}", crate::ui::dim(label(k))))
+        })
+        .unzip();
     (plain.join("  "), color.join("  "))
 }
 

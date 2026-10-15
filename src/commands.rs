@@ -63,16 +63,7 @@ fn local_badges(ctx: &Ctx, stack: &Stack, idx: usize) -> Vec<String> {
     if let Some(p) = parent_tip {
         if c.parents.first() != Some(p) && c.sha != *p {
             // Only off the happy path: count the branch's own commits (one git call).
-            let mut below: Vec<String> = [ctx.refs.remote.get(&stack.trunk.branch), ctx.refs.heads.get(&stack.trunk.branch).map(|c| &c.sha)]
-                .into_iter()
-                .flatten()
-                .cloned()
-                .collect();
-            for lower in &stack.branches[..idx] {
-                below.push(lower.head.clone());
-                below.extend(ctx.refs.head(&lower.branch).map(str::to_string));
-            }
-            let own = git::own_commits(&c.sha, &below).map(|v| v.len()).unwrap_or(1);
+            let own = git::own_commits(&c.sha, &below_heads(ctx, stack, idx)).map(|v| v.len()).unwrap_or(1);
             out.push(if own > 1 {
                 ui::red(&format!("{own} commits (gt squash)"))
             } else if parent == stack.trunk.branch {
@@ -90,6 +81,23 @@ fn local_badges(ctx: &Ctx, stack: &Stack, idx: usize) -> Vec<String> {
     out
 }
 
+/// Commits that belong below branch `idx`: the trunk (local and remote) and
+/// every lower branch's current and last-recorded head. What's left on the
+/// branch is its own work.
+fn below_heads(ctx: &Ctx, stack: &Stack, idx: usize) -> Vec<String> {
+    let trunk = &stack.trunk.branch;
+    let mut below: Vec<String> = [ctx.refs.remote.get(trunk), ctx.refs.heads.get(trunk).map(|c| &c.sha)]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect();
+    for lower in &stack.branches[..idx] {
+        below.push(lower.head.clone());
+        below.extend(ctx.refs.head(&lower.branch).map(str::to_string));
+    }
+    below
+}
+
 /// One branch line's text after the graph column: name, PR, badges, and (in
 /// detail mode) the commit subject.
 struct Cols {
@@ -97,7 +105,7 @@ struct Cols {
     /// Reserve a PR-number column (only when some branch in the group has a PR).
     pr: bool,
     detail: bool,
-    /// Each branch's diff size as (plain, colored), and the widest plain one.
+    /// Each branch's src lines changed as (plain, colored), and the widest plain one.
     sizes: HashMap<String, (String, String)>,
     size_width: usize,
 }
@@ -214,7 +222,8 @@ fn graph_rows(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bool)
         let sizes: HashMap<String, (String, String)> = stacks
             .iter()
             .flat_map(|s| (0..s.branches.len()).map(move |i| (*s, i)))
-            .filter_map(|(s, i)| Some((s.branches[i].branch.clone(), loc::summary(&branch_loc(ctx, s, i)?.total))))
+            // Just src lines, to keep the graph narrow; `gt loc` has the full split.
+            .filter_map(|(s, i)| Some((s.branches[i].branch.clone(), loc::counts(&branch_loc(ctx, s, i)?.total.src))))
             .collect();
         let layout = Cols {
             width: branches().map(|b| b.branch.len()).max().unwrap_or(0),
@@ -268,15 +277,19 @@ fn branch_loc(ctx: &Ctx, stack: &Stack, idx: usize) -> Option<loc::Diff> {
         // No commit of its own yet.
         return Some(loc::Diff::empty(&c.sha));
     }
-    // Off the happy path (several commits, or not restacked), diff from where
-    // it forked so the size covers the whole PR, not just the last commit.
+    // Off the happy path (several commits, or not restacked), diff from the
+    // parent of the branch's oldest own commit so the size covers all of its
+    // work but none of what's below it (including work since squash-merged).
     let base = match c.parents.first() {
         Some(p) if parent_tips.contains(&Some(p.as_str())) => None,
-        first => parent_tips
-            .iter()
-            .flatten()
-            .find_map(|t| git::merge_base(t, &c.sha))
-            .filter(|mb| Some(mb) != first),
+        _ => {
+            let own = git::own_commits(&c.sha, &below_heads(ctx, stack, idx)).ok()?;
+            match own.first() {
+                None => return Some(loc::Diff::empty(&c.sha)),
+                Some(oldest) if *oldest == c.sha => None,
+                Some(oldest) => Some(git::rev_parse(&format!("{oldest}^"))?),
+            }
+        }
     };
     loc::of_commit(&ctx.info.common_dir, &c.sha, base.as_deref()).ok()
 }
