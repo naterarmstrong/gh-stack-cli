@@ -67,6 +67,11 @@ impl Split {
         }
     }
 
+    /// Every kind added together.
+    pub fn sum(&self) -> Lines {
+        self.iter().fold(Lines::default(), |a, (_, l)| Lines { add: a.add + l.add, del: a.del + l.del })
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (Kind, Lines)> {
         [(Kind::Src, self.src), (Kind::Test, self.test), (Kind::Doc, self.doc), (Kind::Gen, self.generated)].into_iter()
     }
@@ -204,7 +209,8 @@ fn compute(commit: &str, base: Option<&str>) -> Result<Diff> {
 
         // Removed lines are classified with the old file's test regions, added with the new one's.
         let (old_tests, new_tests) = if kind == Kind::Src && r.path.ends_with(".rs") && !binary {
-            let ranges = |oid: &str| blob(oid).map(|b| rust_test_ranges(&String::from_utf8_lossy(&b))).unwrap_or_default();
+            let ranges =
+                |oid: &str| blob(oid).map(|b| rust_test_ranges(&String::from_utf8_lossy(&b))).unwrap_or_default();
             (ranges(&r.old_blob), ranges(&r.new_blob))
         } else {
             (vec![], vec![])
@@ -294,8 +300,16 @@ fn linguist_attrs<'a>(commit: &str, paths: impl Iterator<Item = &'a str>) -> Has
     if input.is_empty() {
         return HashMap::new();
     }
-    let args =
-        ["check-attr", "-z", "--stdin", "--source", commit, "linguist-generated", "linguist-vendored", "linguist-documentation"];
+    let args = [
+        "check-attr",
+        "-z",
+        "--stdin",
+        "--source",
+        commit,
+        "linguist-generated",
+        "linguist-vendored",
+        "linguist-documentation",
+    ];
     let Ok(out) = git::run_raw(None, &args, Some(&input), &[]) else { return HashMap::new() };
     if !out.ok {
         return HashMap::new();
@@ -331,7 +345,9 @@ fn classify(path: &str, attr: Option<Kind>, content: impl FnOnce() -> Option<Vec
 
     let generated_name = matches!(name, "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock" | "go.sum")
         || matches!(ext, "lock" | "svg" | "map" | "snap")
-        || [".min.js", ".min.css", "_pb2.py", "_pb2.pyi", ".pb.go", ".generated.ts", ".gen.ts"].iter().any(|s| name.ends_with(s));
+        || [".min.js", ".min.css", "_pb2.py", "_pb2.pyi", ".pb.go", ".generated.ts", ".gen.ts"]
+            .iter()
+            .any(|s| name.ends_with(s));
     if generated_name || in_dir(&["generated", "__generated__", "vendor", "node_modules"]) {
         return Kind::Gen;
     }
@@ -416,16 +432,24 @@ pub fn label(k: Kind) -> &'static str {
 
 /// `+120 −30` as (plain, colored) so callers can pad on the plain width.
 pub fn counts(l: &Lines) -> (String, String) {
-    use crate::ui;
+    paint_counts(l, crate::ui::green, crate::ui::red)
+}
+
+/// `counts` in dim colors, for a secondary figure beside a `counts` one.
+pub fn faint_counts(l: &Lines) -> (String, String) {
+    paint_counts(l, crate::ui::faint_green, crate::ui::faint_red)
+}
+
+fn paint_counts(l: &Lines, add: fn(&str) -> String, del: fn(&str) -> String) -> (String, String) {
     let mut p = vec![];
     let mut c = vec![];
     if l.add > 0 {
         p.push(format!("+{}", human(l.add)));
-        c.push(ui::green(&format!("+{}", human(l.add))));
+        c.push(add(&format!("+{}", human(l.add))));
     }
     if l.del > 0 {
         p.push(format!("−{}", human(l.del)));
-        c.push(ui::red(&format!("−{}", human(l.del))));
+        c.push(del(&format!("−{}", human(l.del))));
     }
     (p.join(" "), c.join(" "))
 }

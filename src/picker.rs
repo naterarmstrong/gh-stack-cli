@@ -113,7 +113,11 @@ pub fn pick(prompt: &str, items: &[Item], initial: Option<&str>) -> Result<Optio
             frame += &format!("\x1b[{}A", drawn - 1);
         }
         frame += "\r\x1b[J";
-        let hint = if query.is_empty() { crate::ui::dim("(type to filter, ↑↓ move, enter select, esc cancel)") } else { String::new() };
+        let hint = if query.is_empty() {
+            crate::ui::dim("(type to filter, ↑↓ move, enter select, esc cancel)")
+        } else {
+            String::new()
+        };
         frame += &format!("{} {}{query} {hint}", crate::ui::cyan("?"), crate::ui::bold(prompt));
         let window = &visible[top..visible.len().min(top + rows)];
         for &i in window {
@@ -167,7 +171,11 @@ pub fn pick(prompt: &str, items: &[Item], initial: Option<&str>) -> Result<Optio
 
 /// Asks a yes/no question on the terminal; anything but y/yes is no.
 pub fn confirm(question: &str) -> Result<bool> {
-    let mut tty = OpenOptions::new().read(true).write(true).open("/dev/tty").context("no terminal to confirm on (use --force)")?;
+    let mut tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .context("no terminal to confirm on (use --force)")?;
     write!(tty, "{} {question} [y/N] ", crate::ui::yellow("?"))?;
     tty.flush()?;
     let mut line = String::new();

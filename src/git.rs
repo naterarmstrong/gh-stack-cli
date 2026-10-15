@@ -112,7 +112,8 @@ pub fn repo_info(repo: &gix::Repository) -> Result<RepoInfo> {
 
 fn identities(repo: &gix::Repository) -> Vec<String> {
     let cfg = repo.config_snapshot();
-    let mut me: Vec<String> = cfg.plumbing().strings("gt.me").unwrap_or_default().iter().map(|v| v.to_string()).collect();
+    let mut me: Vec<String> =
+        cfg.plumbing().strings("gt.me").unwrap_or_default().iter().map(|v| v.to_string()).collect();
     if me.is_empty() {
         me = ["user.email", "user.name"].iter().filter_map(|k| cfg.string(*k)).map(|v| v.to_string()).collect();
     }

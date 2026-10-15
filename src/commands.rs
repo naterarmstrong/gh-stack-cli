@@ -1,8 +1,8 @@
 use crate::ctx::{Ctx, Review};
 use crate::git;
+use crate::github::{MutationBatch, Pr, PrQuery};
 use crate::loc;
 use crate::picker;
-use crate::github::{MutationBatch, Pr, PrQuery};
 use crate::restack;
 use crate::state::{BranchRef, PrRef, Stack};
 use crate::ui;
@@ -106,9 +106,38 @@ struct Cols {
     /// Reserve a PR-number column (only when some branch in the group has a PR).
     pr: bool,
     detail: bool,
-    /// Each branch's src lines changed as (plain, colored), and the widest plain one.
-    sizes: HashMap<String, (String, String)>,
-    size_width: usize,
+    sizes: Sizes,
+}
+
+/// The size column: src lines changed, then the whole diff (every kind) in
+/// fainter colors, each part padded to the widest in its group.
+struct Sizes {
+    /// Per branch, [src, all] as (plain, colored).
+    cells: HashMap<String, [(String, String); 2]>,
+    widths: [usize; 2],
+}
+
+impl Sizes {
+    fn new(diffs: impl Iterator<Item = (String, loc::Diff)>) -> Sizes {
+        let cells: HashMap<String, [(String, String); 2]> =
+            diffs.map(|(b, d)| (b, [loc::counts(&d.total.src), loc::faint_counts(&d.total.sum())])).collect();
+        let width = |i: usize| cells.values().map(|c| c[i].0.chars().count()).max().unwrap_or(0);
+        let widths = [width(0), width(1)];
+        Sizes { cells, widths }
+    }
+
+    /// `branch`'s padded cell plus the gap after it (blank when it has no
+    /// size), or nothing when no branch in the group has one.
+    fn cell(&self, branch: &str) -> String {
+        let cell = self.cells.get(branch);
+        (0..2)
+            .filter(|&i| self.widths[i] > 0)
+            .map(|i| match cell {
+                Some(c) => format!("{}{}  ", c[i].1, " ".repeat(self.widths[i] - c[i].0.chars().count())),
+                None => " ".repeat(self.widths[i] + 2),
+            })
+            .collect()
+    }
 }
 
 fn branch_line(ctx: &Ctx, stack: &Stack, idx: usize, prs: &HashMap<String, Pr>, cols: &Cols) -> String {
@@ -126,9 +155,10 @@ fn branch_line(ctx: &Ctx, stack: &Stack, idx: usize, prs: &HashMap<String, Pr>, 
     let pr = prs.get(&b.branch);
     let num = match pr.map(|p| p.number).or(b.pr_number()) {
         Some(n) => {
-            let url = pr.map(|p| p.url.clone()).filter(|u| !u.is_empty()).unwrap_or_else(|| {
-                b.pull_request.as_ref().map(|p| p.url.clone()).unwrap_or_default()
-            });
+            let url = pr
+                .map(|p| p.url.clone())
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| b.pull_request.as_ref().map(|p| p.url.clone()).unwrap_or_default());
             ui::link(&url, &format!("#{n:<6}"))
         }
         None if cols.pr => format!("{:7}", ""),
@@ -145,11 +175,7 @@ fn branch_line(ctx: &Ctx, stack: &Stack, idx: usize, prs: &HashMap<String, Pr>, 
         }
     }
     let num = if num.is_empty() { num } else { format!("{num} ") };
-    let size = match cols.sizes.get(&b.branch) {
-        Some((plain, color)) => format!("{color}{}  ", " ".repeat(cols.size_width - plain.chars().count())),
-        None if cols.size_width > 0 => " ".repeat(cols.size_width + 2),
-        None => String::new(),
-    };
+    let size = cols.sizes.cell(&b.branch);
     let mut line = format!("{name}  {num}{size}{}", badges.join(&ui::dim(" · ")));
     if cols.detail && !b.merged() {
         if let Some(c) = ctx.refs.heads.get(&b.branch) {
@@ -220,17 +246,17 @@ fn graph_rows(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bool)
         }
         let cols = stacks.len();
         let branches = || stacks.iter().flat_map(|s| &s.branches).filter(|b| shown(b));
-        let sizes: HashMap<String, (String, String)> = stacks
-            .iter()
-            .flat_map(|s| (0..s.branches.len()).map(move |i| (*s, i)))
-            // Just src lines, to keep the graph narrow; `gt loc` has the full split.
-            .filter_map(|(s, i)| Some((s.branches[i].branch.clone(), loc::counts(&branch_loc(ctx, s, i)?.total.src))))
-            .collect();
+        // Src lines and the overall size, to keep the graph narrow; `gt loc` has the full split.
+        let sizes = Sizes::new(
+            stacks
+                .iter()
+                .flat_map(|s| (0..s.branches.len()).map(move |i| (*s, i)))
+                .filter_map(|(s, i)| Some((s.branches[i].branch.clone(), branch_loc(ctx, s, i)?))),
+        );
         let layout = Cols {
             width: branches().map(|b| b.branch.len()).max().unwrap_or(0),
             pr: branches().any(|b| prs.contains_key(&b.branch) || b.pr_number().is_some()),
             detail,
-            size_width: sizes.values().map(|(p, _)| p.chars().count()).max().unwrap_or(0),
             sizes,
         };
         for (col, stack) in stacks.iter().enumerate() {
@@ -325,15 +351,11 @@ fn render_reviews(ctx: &Ctx, prs: &HashMap<String, Pr>, detail: bool) {
     }
     let cur = ctx.info.current_branch.as_deref();
     let width = ctx.reviews.iter().map(|r| r.branch.len()).max().unwrap_or(0);
-    let sizes: HashMap<&str, (String, String)> = ctx
-        .reviews
-        .iter()
-        .filter_map(|r| {
-            let d = untracked_loc(ctx, &r.branch, ctx.refs.head(&r.branch)?).ok()?;
-            Some((r.branch.as_str(), loc::counts(&d.total.src)))
-        })
-        .collect();
-    let size_width = sizes.values().map(|(p, _)| p.chars().count()).max().unwrap_or(0);
+    let sizes = Sizes::new(
+        ctx.reviews
+            .iter()
+            .filter_map(|r| Some((r.branch.clone(), untracked_loc(ctx, &r.branch, ctx.refs.head(&r.branch)?).ok()?))),
+    );
     let has_pr = ctx.reviews.iter().any(|r| r.pr.is_some());
     // From the remote URL, not ctx.gh(), which would look up a token.
     let repo_url = git::remote_urls(&ctx.remote)
@@ -349,17 +371,16 @@ fn render_reviews(ctx: &Ctx, prs: &HashMap<String, Pr>, detail: bool) {
         let pr = prs.get(&r.branch);
         let num = match r.pr {
             Some(n) => {
-                let url = pr.map(|p| p.url.clone()).filter(|u| !u.is_empty()).or_else(|| Some(format!("{}/pull/{n}", repo_url.as_ref()?)));
+                let url = pr
+                    .map(|p| p.url.clone())
+                    .filter(|u| !u.is_empty())
+                    .or_else(|| Some(format!("{}/pull/{n}", repo_url.as_ref()?)));
                 format!("{} ", ui::link(&url.unwrap_or_default(), &format!("#{n:<6}")))
             }
             None if has_pr => format!("{:8}", ""),
             None => String::new(),
         };
-        let size = match sizes.get(r.branch.as_str()) {
-            Some((plain, color)) => format!("{color}{}  ", " ".repeat(size_width - plain.chars().count())),
-            None if size_width > 0 => " ".repeat(size_width + 2),
-            None => String::new(),
-        };
+        let size = sizes.cell(&r.branch);
         let mut badges: Vec<String> = worktree_badge(ctx, &r.branch).into_iter().collect();
         badges.extend(author_badge(ctx, &r.branch));
         badges.push(review_badge(ctx, r));
@@ -414,10 +435,8 @@ fn own_loc(ctx: &Ctx, tip: &str, below: &[String]) -> Option<loc::Diff> {
 /// or remote, so neither a stale local trunk nor several commits skew it.
 fn untracked_loc(ctx: &Ctx, branch: &str, tip: &str) -> Result<loc::Diff> {
     let trunk = ctx.default_trunk();
-    let below: Vec<String> = [ctx.remote_ref(&trunk), format!("refs/heads/{trunk}")]
-        .iter()
-        .filter_map(|r| git::rev_parse(r))
-        .collect();
+    let below: Vec<String> =
+        [ctx.remote_ref(&trunk), format!("refs/heads/{trunk}")].iter().filter_map(|r| git::rev_parse(r)).collect();
     if branch == trunk || below.is_empty() {
         return loc::of_commit(&ctx.info.common_dir, tip, None);
     }
@@ -501,8 +520,8 @@ fn query_prs(ctx: &Ctx, queries: Vec<(String, PrQuery)>, strict: bool) -> Result
         // A head lookup can find an old PR from a reused branch name; only
         // trust a non-open one if it points at a commit we actually have.
         if strict && matches!(q, PrQuery::Head(_)) && pr.state != "OPEN" {
-            let ours = ctx.refs.head(&name) == Some(&pr.head_ref_oid)
-                || ctx.refs.remote.get(&name) == Some(&pr.head_ref_oid);
+            let ours =
+                ctx.refs.head(&name) == Some(&pr.head_ref_oid) || ctx.refs.remote.get(&name) == Some(&pr.head_ref_oid);
             if !ours {
                 continue;
             }
@@ -516,7 +535,8 @@ pub fn log(stack_only: bool, offline: bool) -> Result<()> {
     let ctx = Ctx::new(false)?;
     let sis = stacks_to_show(&ctx, !stack_only);
     // Review branches belong to no stack, so only the full view shows them.
-    let show_reviews = !stack_only || ctx.info.current_branch.as_deref().is_none_or(|c| ctx.store.file.find(c).is_none());
+    let show_reviews =
+        !stack_only || ctx.info.current_branch.as_deref().is_none_or(|c| ctx.store.file.find(c).is_none());
     if sis.is_empty() && (!show_reviews || ctx.reviews.is_empty()) {
         println!("No stacks. Start one with `gt create <name> -m <message>`.");
         return Ok(());
@@ -675,7 +695,10 @@ pub fn create(name: Option<String>, message: Option<String>, all: bool) -> Resul
         Some(si) => (si, ctx.store.file.stacks[si].index_of(&cur).unwrap() + 1),
         None => {
             let is_trunk = cur == ctx.default_trunk() || ctx.store.file.stacks.iter().any(|s| s.trunk.branch == cur);
-            let mut stack = Stack { trunk: BranchRef::new(&if is_trunk { cur.clone() } else { ctx.default_trunk() }), ..Default::default() };
+            let mut stack = Stack {
+                trunk: BranchRef::new(&if is_trunk { cur.clone() } else { ctx.default_trunk() }),
+                ..Default::default()
+            };
             if !is_trunk {
                 ui::info(&format!("tracking {} as the bottom of a new stack", ui::bold(&cur)));
                 stack.branches.push(BranchRef::new(&cur));
@@ -880,8 +903,15 @@ pub fn delete_upstack(target: Option<String>, force: bool) -> Result<()> {
         let (args, label) = if free {
             (vec!["checkout".to_string(), "--quiet".into(), dest.clone()], dest.clone())
         } else {
-            let tip = if dest == stack.trunk.branch { ctx.trunk_tip(&dest)? } else { ctx.refs.head(&dest).unwrap_or_default().to_string() };
-            (vec!["checkout".to_string(), "--quiet".into(), "--detach".into(), tip.clone()], format!("{dest} (detached at {})", ui::short(&tip)))
+            let tip = if dest == stack.trunk.branch {
+                ctx.trunk_tip(&dest)?
+            } else {
+                ctx.refs.head(&dest).unwrap_or_default().to_string()
+            };
+            (
+                vec!["checkout".to_string(), "--quiet".into(), "--detach".into(), tip.clone()],
+                format!("{dest} (detached at {})", ui::short(&tip)),
+            )
         };
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = git::run_raw(None, &args, None, &[])?;
@@ -989,7 +1019,10 @@ fn push(ctx: &Ctx, branches: &[String], no_verify: bool) -> Result<()> {
 fn needs_push(ctx: &Ctx, si: usize) -> Vec<String> {
     ctx.store.file.stacks[si]
         .active()
-        .filter(|(_, b)| ctx.refs.head(&b.branch).is_some() && ctx.refs.head(&b.branch) != ctx.refs.remote.get(&b.branch).map(String::as_str))
+        .filter(|(_, b)| {
+            ctx.refs.head(&b.branch).is_some()
+                && ctx.refs.head(&b.branch) != ctx.refs.remote.get(&b.branch).map(String::as_str)
+        })
         .map(|(_, b)| b.branch.clone())
         .collect()
 }
@@ -1001,7 +1034,9 @@ fn adopt_remote(ctx: &Ctx, branch: &str, parent_ref: &str) -> Result<()> {
     let local = ctx.refs.heads.get(branch).cloned();
     let base = match &local {
         Some(l) if l.parents.len() == 1 && git::is_ancestor(&l.sha, &remote) => l.parents[0].clone(),
-        _ => git::merge_base(&remote, parent_ref).ok_or_else(|| anyhow!("{branch}: no merge base with {parent_ref}"))?,
+        _ => {
+            git::merge_base(&remote, parent_ref).ok_or_else(|| anyhow!("{branch}: no merge base with {parent_ref}"))?
+        }
     };
     let remote_parent = git::rev_parse(&format!("{remote}^"));
     let new = if remote_parent.as_deref() == Some(base.as_str()) {
@@ -1124,7 +1159,8 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
             let parent = s.parent_of(idx);
             let parent_ref =
                 if parent == s.trunk.branch { ctx.remote_ref(parent) } else { format!("refs/heads/{parent}") };
-            let local_unchanged = local.is_none() || local.as_ref() == old_r || git::is_ancestor(local.as_deref().unwrap(), &new_r);
+            let local_unchanged =
+                local.is_none() || local.as_ref() == old_r || git::is_ancestor(local.as_deref().unwrap(), &new_r);
             if local_unchanged || opts.prefer_remote {
                 adopt_remote(&ctx, &b.branch, &parent_ref)?;
             } else {
@@ -1174,7 +1210,10 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
                 ctx.save()?;
                 std::process::exit(1);
             }
-            Err(e) => ui::warn(&format!("not restacking or pushing the stack on {}: {e:#}", ctx.store.file.stacks[si].trunk.branch)),
+            Err(e) => ui::warn(&format!(
+                "not restacking or pushing the stack on {}: {e:#}",
+                ctx.store.file.stacks[si].trunk.branch
+            )),
         }
     }
 
@@ -1258,7 +1297,10 @@ fn leave_branch(ctx: &mut Ctx, b: &str, next: Option<String>, trunk: &str) -> Re
         }
         None => {
             let tip = ctx.trunk_tip(trunk)?;
-            (vec!["checkout".into(), "--quiet".into(), "--detach".into(), tip.clone()], format!("{} (detached)", ctx.remote_ref(trunk).trim_start_matches("refs/remotes/")))
+            (
+                vec!["checkout".into(), "--quiet".into(), "--detach".into(), tip.clone()],
+                format!("{} (detached)", ctx.remote_ref(trunk).trim_start_matches("refs/remotes/")),
+            )
         }
     };
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -1283,13 +1325,8 @@ pub fn clear_merged(force: bool, diverged: bool) -> Result<()> {
 
     let all: Vec<usize> = (0..ctx.store.file.stacks.len()).collect();
     let mut queries: Vec<(String, PrQuery)> = all.iter().flat_map(|&si| ctx.pr_queries(si, true)).collect();
-    let mut untracked: Vec<String> = ctx
-        .refs
-        .heads
-        .keys()
-        .filter(|b| !trunks.contains(*b) && ctx.store.file.find(b).is_none())
-        .cloned()
-        .collect();
+    let mut untracked: Vec<String> =
+        ctx.refs.heads.keys().filter(|b| !trunks.contains(*b) && ctx.store.file.find(b).is_none()).cloned().collect();
     untracked.sort();
     queries.extend(untracked.iter().map(|b| (b.clone(), PrQuery::Head(b.clone()))));
     let n_checked = queries.iter().filter(|(b, _)| ctx.refs.heads.contains_key(b)).count();
@@ -1403,7 +1440,8 @@ pub fn submit(draft: bool, no_verify: bool, relink: bool) -> Result<()> {
     let stack = &mut ctx.store.file.stacks[si];
     for (idx, b) in stack.branches.iter_mut().enumerate() {
         if let Some(pr) = prs.get(&b.branch).filter(|p| p.state == "OPEN") {
-            b.pull_request = Some(PrRef { number: pr.number, id: pr.id.clone(), url: pr.url.clone(), ..Default::default() });
+            b.pull_request =
+                Some(PrRef { number: pr.number, id: pr.id.clone(), url: pr.url.clone(), ..Default::default() });
         } else if created.contains(&idx) {
             let p = &result[format!("c{idx}")]["pullRequest"];
             if let Some(n) = p["number"].as_u64() {
@@ -1452,8 +1490,7 @@ fn link_stack(ctx: &mut Ctx, si: usize, relink: bool) -> Result<()> {
     let linked = match remote {
         None => gh.create_stack(&open)?,
         Some(r) => {
-            let r_open: Vec<u64> =
-                r.pull_requests.iter().filter(|p| p.merged_at.is_none()).map(|p| p.number).collect();
+            let r_open: Vec<u64> = r.pull_requests.iter().filter(|p| p.merged_at.is_none()).map(|p| p.number).collect();
             if r_open == open {
                 r
             } else if open.starts_with(&r_open) {
@@ -1580,7 +1617,10 @@ pub fn review(target: Option<String>) -> Result<()> {
                 .iter()
                 .map(|p| {
                     let title: String = p.title.chars().take(70).collect();
-                    let mut badges = vec![ui::green(&format!("+{}", loc::human(p.additions as u32))), ui::red(&format!("−{}", loc::human(p.deletions as u32)))];
+                    let mut badges = vec![
+                        ui::green(&format!("+{}", loc::human(p.additions as u32))),
+                        ui::red(&format!("−{}", loc::human(p.deletions as u32))),
+                    ];
                     if let Some(a) = &p.author {
                         badges.push(ui::blue(&format!("by {}", a.login)));
                     }
@@ -1659,7 +1699,12 @@ pub fn review(target: Option<String>) -> Result<()> {
         }
         Some(l) => {
             ctx.set_branch(&name, Some(&l), &sha)?;
-            ui::ok(&format!("reset {} to the PR head {} (was {})", ui::bold(&name), ui::short(&sha), ui::dim(ui::short(&l))));
+            ui::ok(&format!(
+                "reset {} to the PR head {} (was {})",
+                ui::bold(&name),
+                ui::short(&sha),
+                ui::dim(ui::short(&l))
+            ));
         }
     }
     let marker = pr.as_ref().map(|p| p.number.to_string()).unwrap_or_else(|| "true".into());

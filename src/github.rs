@@ -34,10 +34,8 @@ fn token(host: &str) -> Result<String> {
             }
         }
     }
-    let out = Command::new("gh")
-        .args(["auth", "token", "--hostname", host])
-        .output()
-        .context("running `gh auth token`")?;
+    let out =
+        Command::new("gh").args(["auth", "token", "--hostname", host]).output().context("running `gh auth token`")?;
     if !out.status.success() {
         bail!("no GitHub token: set GH_TOKEN or run `gh auth login`");
     }
@@ -267,7 +265,11 @@ impl Client {
     }
 
     pub fn create_stack(&self, prs: &[u64]) -> Result<RemoteStack> {
-        let v = self.rest("POST", &format!("repos/{}/{}/stacks", self.owner, self.repo), Some(json!({ "pull_requests": prs })))?;
+        let v = self.rest(
+            "POST",
+            &format!("repos/{}/{}/stacks", self.owner, self.repo),
+            Some(json!({ "pull_requests": prs })),
+        )?;
         Ok(serde_json::from_value(v.ok_or_else(|| anyhow!("empty create-stack response"))?)?)
     }
 
@@ -297,7 +299,16 @@ pub struct MutationBatch {
 }
 
 impl MutationBatch {
-    pub fn create_pr(&mut self, alias: &str, repo_id: &str, base: &str, head: &str, title: &str, body: &str, draft: bool) {
+    pub fn create_pr(
+        &mut self,
+        alias: &str,
+        repo_id: &str,
+        base: &str,
+        head: &str,
+        title: &str,
+        body: &str,
+        draft: bool,
+    ) {
         self.parts.push(format!(
             "{alias}: createPullRequest(input: {{repositoryId: {}, baseRefName: {}, headRefName: {}, title: {}, body: {}, draft: {draft}}}) {{ pullRequest {{ number id url }} }}",
             json!(repo_id), json!(base), json!(head), json!(title), json!(body)

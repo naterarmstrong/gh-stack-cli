@@ -53,7 +53,8 @@ fn reviews(repo: &gix::Repository) -> Vec<Review> {
 /// Each tracked branch's configured upstream: (branch.<b>.remote, branch.<b>.merge).
 fn upstreams(repo: &gix::Repository, branches: &HashSet<String>) -> HashMap<String, (String, String)> {
     let cfg = repo.config_snapshot();
-    let get = |b: &str, k: &str| cfg.string(format!("branch.{b}.{k}").as_str()).map(|v| v.to_string()).unwrap_or_default();
+    let get =
+        |b: &str, k: &str| cfg.string(format!("branch.{b}.{k}").as_str()).map(|v| v.to_string()).unwrap_or_default();
     branches.iter().map(|b| (b.clone(), (get(b, "remote"), get(b, "merge")))).collect()
 }
 
@@ -154,10 +155,7 @@ impl Ctx {
     /// Index of the stack containing the current branch.
     pub fn current_stack(&self) -> Result<usize> {
         let cur = self.current()?;
-        self.store
-            .file
-            .find(cur)
-            .ok_or_else(|| anyhow!("{cur} is not part of a stack (see `gt ls`, `gt track`)"))
+        self.store.file.find(cur).ok_or_else(|| anyhow!("{cur} is not part of a stack (see `gt ls`, `gt track`)"))
     }
 
     pub fn remote_ref(&self, branch: &str) -> String {

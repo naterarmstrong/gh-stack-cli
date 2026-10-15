@@ -22,6 +22,13 @@ pub fn red(s: &str) -> String {
 pub fn green(s: &str) -> String {
     paint("32", s)
 }
+/// Dim green and red, for a secondary figure beside a colored one.
+pub fn faint_green(s: &str) -> String {
+    paint("2;32", s)
+}
+pub fn faint_red(s: &str) -> String {
+    paint("2;31", s)
+}
 pub fn yellow(s: &str) -> String {
     paint("33", s)
 }

@@ -132,10 +132,7 @@ pub fn squash(ctx: &Ctx, si: usize) -> Result<Vec<Update>> {
                 .ok_or_else(|| anyhow::anyhow!("{} shares no history with {}", b.branch, stack.trunk.branch))?,
             Some((old, new)) => {
                 if !git::is_ancestor(old, &c.sha) {
-                    bail!(
-                        "{} doesn't contain its parent's current tip; rebase it by hand before squashing",
-                        b.branch
-                    );
+                    bail!("{} doesn't contain its parent's current tip; rebase it by hand before squashing", b.branch);
                 }
                 new.clone()
             }
@@ -174,7 +171,9 @@ pub fn apply(ctx: &mut Ctx, updates: &[Update]) -> Result<()> {
 pub fn record_heads(ctx: &mut Ctx) {
     let refs = &ctx.refs;
     for stack in ctx.store.file.stacks.iter_mut() {
-        if let Some(tip) = refs.remote.get(&stack.trunk.branch).or_else(|| refs.heads.get(&stack.trunk.branch).map(|c| &c.sha)) {
+        if let Some(tip) =
+            refs.remote.get(&stack.trunk.branch).or_else(|| refs.heads.get(&stack.trunk.branch).map(|c| &c.sha))
+        {
             stack.trunk.head = tip.clone();
         }
         for b in stack.branches.iter_mut().filter(|b| !b.merged()) {

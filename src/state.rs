@@ -84,12 +84,7 @@ impl Stack {
 
     /// The branch an unmerged branch at `idx` should sit on.
     pub fn parent_of(&self, idx: usize) -> &str {
-        self.branches[..idx]
-            .iter()
-            .rev()
-            .find(|b| !b.merged())
-            .map(|b| b.branch.as_str())
-            .unwrap_or(&self.trunk.branch)
+        self.branches[..idx].iter().rev().find(|b| !b.merged()).map(|b| b.branch.as_str()).unwrap_or(&self.trunk.branch)
     }
 
     pub fn fully_merged(&self) -> bool {
@@ -116,9 +111,10 @@ impl StackFile {
     }
 
     pub fn find_pr(&self, pr: u64) -> Option<(usize, usize)> {
-        self.stacks.iter().enumerate().find_map(|(si, s)| {
-            s.branches.iter().position(|b| b.pr_number() == Some(pr)).map(|bi| (si, bi))
-        })
+        self.stacks
+            .iter()
+            .enumerate()
+            .find_map(|(si, s)| s.branches.iter().position(|b| b.pr_number() == Some(pr)).map(|bi| (si, bi)))
     }
 }
 
@@ -165,10 +161,9 @@ impl Store {
                 }
                 (file, Some(data))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
-                StackFile { schema_version: 1, repository: String::new(), stacks: vec![], extra: Map::new() },
-                None,
-            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (StackFile { schema_version: 1, repository: String::new(), stacks: vec![], extra: Map::new() }, None)
+            }
             Err(e) => return Err(e).context("reading .git/gh-stack"),
         };
         Ok(Store { path, file, loaded })
