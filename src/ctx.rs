@@ -6,15 +6,48 @@ use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-/// Branches whose commits need decoding: every stacked branch and trunk.
-fn tracked(store: &Store) -> HashSet<String> {
+/// Branches whose commits need decoding: every stacked branch, trunk and review branch.
+fn tracked(store: &Store, reviews: &[Review]) -> HashSet<String> {
     store
         .file
         .stacks
         .iter()
         .flat_map(|s| std::iter::once(&s.trunk).chain(&s.branches))
         .map(|b| b.branch.clone())
+        .chain(reviews.iter().map(|r| r.branch.clone()))
         .collect()
+}
+
+/// A branch pulled down by `gt review`, marked by `branch.<b>.gtReview`.
+#[derive(Clone, Debug)]
+pub struct Review {
+    pub branch: String,
+    pub pr: Option<u64>,
+}
+
+impl Review {
+    /// Fork PRs are checked out as `pr/<N>` and have no branch on our remote.
+    pub fn fork_pr(&self) -> Option<u64> {
+        self.pr.filter(|n| self.branch == format!("pr/{n}"))
+    }
+}
+
+fn reviews(repo: &gix::Repository) -> Vec<Review> {
+    let cfg = repo.config_snapshot();
+    let mut v: Vec<Review> = cfg
+        .plumbing()
+        .sections_by_name("branch")
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let branch = s.header().subsection_name()?.to_string();
+            let marker = s.value("gtReview")?.to_string();
+            Some(Review { branch, pr: marker.parse().ok() })
+        })
+        .collect();
+    v.sort_by(|a, b| a.branch.cmp(&b.branch));
+    v.dedup_by(|a, b| a.branch == b.branch);
+    v
 }
 
 /// Each tracked branch's configured upstream: (branch.<b>.remote, branch.<b>.merge).
@@ -30,6 +63,8 @@ pub struct Ctx {
     pub remote: String,
     pub refs: Refs,
     pub worktrees: HashMap<String, PathBuf>,
+    /// Review branches that still exist locally.
+    pub reviews: Vec<Review>,
     upstreams: HashMap<String, (String, String)>,
     lock: Option<Lock>,
     gh: OnceCell<Client>,
@@ -44,11 +79,13 @@ impl Ctx {
         let lock = if mutating { Some(Lock::acquire(&info.common_dir)?) } else { None };
         let store = Store::load(&info.common_dir)?;
         let remote = std::env::var("GT_REMOTE").unwrap_or_else(|_| "origin".into());
-        let tracked = tracked(&store);
+        let mut reviews = reviews(&repo);
+        let tracked = tracked(&store, &reviews);
         let refs = Refs::load(&repo, &remote, &tracked)?;
+        reviews.retain(|r| refs.heads.contains_key(&r.branch));
         let worktrees = git::worktrees(&info.common_dir);
         let upstreams = upstreams(&repo, &tracked);
-        Ok(Ctx { info, store, remote, refs, worktrees, upstreams, lock, gh: OnceCell::new() })
+        Ok(Ctx { info, store, remote, refs, worktrees, reviews, upstreams, lock, gh: OnceCell::new() })
     }
 
     pub fn gh(&self) -> Result<&Client> {
@@ -69,8 +106,11 @@ impl Ctx {
         // A fresh handle so ref and object caches see what git just wrote.
         let repo = git::open()?;
         self.info = git::repo_info(&repo)?;
-        let tracked = tracked(&self.store);
+        let mut reviews = reviews(&repo);
+        let tracked = tracked(&self.store, &reviews);
         self.refs = Refs::load(&repo, &self.remote, &tracked)?;
+        reviews.retain(|r| self.refs.heads.contains_key(&r.branch));
+        self.reviews = reviews;
         self.worktrees = git::worktrees(&self.info.common_dir);
         self.upstreams = upstreams(&repo, &tracked);
         Ok(())
@@ -97,7 +137,7 @@ impl Ctx {
 
     /// Every stacked branch and trunk across all stacks.
     pub fn all_branches(&self) -> Vec<String> {
-        let mut v: Vec<String> = tracked(&self.store).into_iter().collect();
+        let mut v: Vec<String> = tracked(&self.store, &[]).into_iter().collect();
         v.sort();
         v
     }
@@ -122,6 +162,24 @@ impl Ctx {
 
     pub fn remote_ref(&self, branch: &str) -> String {
         format!("refs/remotes/{}/{branch}", self.remote)
+    }
+
+    /// Where a review branch's PR head was last fetched to: the remote-tracking
+    /// branch, or for a fork PR, `refs/gt/pull/<N>`.
+    pub fn review_ref(&self, r: &Review) -> String {
+        match r.fork_pr() {
+            Some(n) => format!("refs/gt/pull/{n}"),
+            None => self.remote_ref(&r.branch),
+        }
+    }
+
+    /// The commit at `review_ref`, if it's been fetched.
+    pub fn review_tip(&self, r: &Review) -> Option<&str> {
+        match r.fork_pr() {
+            Some(n) => self.refs.pulls.get(&n),
+            None => self.refs.remote.get(&r.branch),
+        }
+        .map(String::as_str)
     }
 
     /// The commit a stack's bottom branch should be rebased onto: the remote trunk when known.

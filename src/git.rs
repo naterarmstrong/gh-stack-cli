@@ -134,6 +134,8 @@ pub struct Commit {
 pub struct Refs {
     pub heads: HashMap<String, Commit>,
     pub remote: HashMap<String, String>,
+    /// Fork PR heads fetched by `gt review`, by PR number (`refs/gt/pull/<N>`).
+    pub pulls: HashMap<u64, String>,
 }
 
 impl Refs {
@@ -172,7 +174,15 @@ impl Refs {
                 remote_refs.insert(b.to_string(), id.to_string());
             }
         }
-        Ok(Refs { heads, remote: remote_refs })
+        let mut pulls = HashMap::new();
+        for r in platform.prefixed("refs/gt/pull/")? {
+            let Ok(r) = r else { continue };
+            let Some(id) = r.try_id() else { continue };
+            if let Some(n) = r.name().as_bstr().to_string().strip_prefix("refs/gt/pull/").and_then(|n| n.parse().ok()) {
+                pulls.insert(n, id.to_string());
+            }
+        }
+        Ok(Refs { heads, remote: remote_refs, pulls })
     }
 
     pub fn head(&self, branch: &str) -> Option<&str> {
@@ -222,6 +232,23 @@ pub fn own_commits(tip: &str, excludes: &[String]) -> Result<Vec<String>> {
     args.extend(excludes.iter().filter(|e| !e.is_empty()).map(|e| format!("^{e}")));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     Ok(run(&args)?.lines().map(str::to_string).collect())
+}
+
+/// Commits only on `a` and commits only on `b`.
+pub fn ahead_behind(a: &str, b: &str) -> Option<(usize, usize)> {
+    let out = run(&["rev-list", "--left-right", "--count", &format!("{a}...{b}")]).ok()?;
+    let (l, r) = out.split_once(char::is_whitespace)?;
+    Some((l.trim().parse().ok()?, r.trim().parse().ok()?))
+}
+
+/// When anything in this repo last ran `git fetch`: the newest FETCH_HEAD
+/// across the main checkout and every worktree.
+pub fn last_fetch(common_dir: &Path) -> Option<std::time::SystemTime> {
+    let worktrees = std::fs::read_dir(common_dir.join("worktrees")).into_iter().flatten().flatten().map(|e| e.path());
+    std::iter::once(common_dir.to_path_buf())
+        .chain(worktrees)
+        .filter_map(|d| std::fs::metadata(d.join("FETCH_HEAD")).and_then(|m| m.modified()).ok())
+        .max()
 }
 
 pub fn merge_base(a: &str, b: &str) -> Option<String> {

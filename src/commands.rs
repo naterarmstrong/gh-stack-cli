@@ -1,4 +1,4 @@
-use crate::ctx::Ctx;
+use crate::ctx::{Ctx, Review};
 use crate::git;
 use crate::loc;
 use crate::picker;
@@ -67,7 +67,8 @@ fn local_badges(ctx: &Ctx, stack: &Stack, idx: usize) -> Vec<String> {
             out.push(if own > 1 {
                 ui::red(&format!("{own} commits (gt squash)"))
             } else if parent == stack.trunk.branch {
-                ui::dim(&format!("behind {parent}"))
+                let behind = git::ahead_behind(&c.sha, p).map(|(_, n)| format!("{n} ")).unwrap_or_default();
+                ui::dim(&format!("{behind}behind {}", trunk_label(ctx, parent)))
             } else {
                 ui::yellow("needs restack")
             });
@@ -253,14 +254,126 @@ fn graph_rows(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bool)
         let marker = if cur == Some(*trunk) { ui::cyan("◉") } else { "◯".to_string() };
         let fan = (1..cols).map(|c| if c == cols - 1 { "─┘" } else { "─┴" }).collect::<String>();
         let name = if cur == Some(*trunk) { ui::bold(&ui::cyan(trunk)) } else { ui::dim(trunk) };
-        let wt = worktree_badge(ctx, trunk).map(|w| format!("  {w}")).unwrap_or_default();
+        let badges: Vec<String> = worktree_badge(ctx, trunk).into_iter().chain(trunk_badge(ctx, trunk)).collect();
+        let badges = if badges.is_empty() { String::new() } else { format!("  {}", badges.join(&ui::dim(" · "))) };
         rows.push(Row {
-            text: format!("{marker}{}  {name}{wt}", ui::dim(&fan)),
+            text: format!("{marker}{}  {name}{badges}", ui::dim(&fan)),
             branch: ctx.refs.heads.contains_key(*trunk).then(|| trunk.to_string()),
             is_trunk: true,
         });
     }
     rows
+}
+
+/// `origin/main` when the remote trunk is known (what stacks rebase onto), else `main`.
+fn trunk_label(ctx: &Ctx, trunk: &str) -> String {
+    if ctx.refs.remote.contains_key(trunk) { format!("{}/{trunk}", ctx.remote) } else { trunk.to_string() }
+}
+
+/// How the local trunk compares with the remote one, as of the last fetch.
+fn trunk_badge(ctx: &Ctx, trunk: &str) -> Option<String> {
+    let r = ctx.refs.remote.get(trunk)?;
+    let remote = format!("{}/{trunk}", ctx.remote);
+    let status = match ctx.refs.head(trunk) {
+        None => ui::dim(&format!("only on {}", ctx.remote)),
+        Some(l) if l == r => ui::dim(&format!("= {remote}")),
+        Some(l) => match git::ahead_behind(l, r) {
+            Some((0, behind)) => ui::yellow(&format!("{behind} behind {remote}")),
+            Some((ahead, 0)) => ui::yellow(&format!("{ahead} ahead of {remote}")),
+            Some((ahead, behind)) => ui::red(&format!("{ahead} ahead, {behind} behind {remote}")),
+            None => return None,
+        },
+    };
+    Some(match git::last_fetch(&ctx.info.common_dir) {
+        Some(t) => format!("{status} {}", ui::dim(&format!("(fetched {})", ago(t)))),
+        None => status,
+    })
+}
+
+fn ago(t: std::time::SystemTime) -> String {
+    let s = t.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    match s {
+        0..60 => "just now".into(),
+        60..3600 => format!("{}m ago", s / 60),
+        3600..86400 => format!("{}h ago", s / 3600),
+        _ => format!("{}d ago", s / 86400),
+    }
+}
+
+/// How a review branch compares with its PR head as of the last fetch. `gt
+/// sync` (or rerunning `gt review`) moves it to the PR head.
+fn review_badge(ctx: &Ctx, r: &Review) -> String {
+    let local = ctx.refs.head(&r.branch).unwrap_or_default();
+    let Some(tip) = ctx.review_tip(r) else {
+        return ui::yellow(if r.fork_pr().is_some() { "PR head not fetched" } else { "gone from remote" });
+    };
+    if tip == local {
+        return ui::green("up to date");
+    }
+    match git::ahead_behind(local, tip) {
+        Some((0, n)) => ui::yellow(&format!("{n} new commit{} (gt sync)", if n == 1 { "" } else { "s" })),
+        Some((n, 0)) => ui::yellow(&format!("{n} local commit{} (gt sync drops)", if n == 1 { "" } else { "s" })),
+        Some(_) => ui::red("force-pushed (gt sync)"),
+        None => ui::red("can't compare with PR head"),
+    }
+}
+
+/// Branches pulled down by `gt review`, below the stacks.
+fn render_reviews(ctx: &Ctx, prs: &HashMap<String, Pr>, detail: bool) {
+    if ctx.reviews.is_empty() {
+        return;
+    }
+    let cur = ctx.info.current_branch.as_deref();
+    let width = ctx.reviews.iter().map(|r| r.branch.len()).max().unwrap_or(0);
+    let sizes: HashMap<&str, (String, String)> = ctx
+        .reviews
+        .iter()
+        .filter_map(|r| {
+            let d = untracked_loc(ctx, &r.branch, ctx.refs.head(&r.branch)?).ok()?;
+            Some((r.branch.as_str(), loc::counts(&d.total.src)))
+        })
+        .collect();
+    let size_width = sizes.values().map(|(p, _)| p.chars().count()).max().unwrap_or(0);
+    let has_pr = ctx.reviews.iter().any(|r| r.pr.is_some());
+    // From the remote URL, not ctx.gh(), which would look up a token.
+    let repo_url = git::remote_urls(&ctx.remote)
+        .iter()
+        .find_map(|u| crate::github::parse_remote(u))
+        .map(|(host, owner, repo)| format!("https://{host}/{owner}/{repo}"));
+    println!("\n{}", ui::dim("Reviewing"));
+    for r in &ctx.reviews {
+        let here = cur == Some(r.branch.as_str());
+        let marker = if here { ui::cyan("◉") } else { "◯".to_string() };
+        let name = format!("{:width$}", r.branch);
+        let name = if here { ui::bold(&ui::cyan(&name)) } else { name };
+        let pr = prs.get(&r.branch);
+        let num = match r.pr {
+            Some(n) => {
+                let url = pr.map(|p| p.url.clone()).filter(|u| !u.is_empty()).or_else(|| Some(format!("{}/pull/{n}", repo_url.as_ref()?)));
+                format!("{} ", ui::link(&url.unwrap_or_default(), &format!("#{n:<6}")))
+            }
+            None if has_pr => format!("{:8}", ""),
+            None => String::new(),
+        };
+        let size = match sizes.get(r.branch.as_str()) {
+            Some((plain, color)) => format!("{color}{}  ", " ".repeat(size_width - plain.chars().count())),
+            None if size_width > 0 => " ".repeat(size_width + 2),
+            None => String::new(),
+        };
+        let mut badges: Vec<String> = worktree_badge(ctx, &r.branch).into_iter().collect();
+        badges.extend(author_badge(ctx, &r.branch));
+        badges.push(review_badge(ctx, r));
+        if let Some(p) = pr {
+            badges.extend(pr_badges(p));
+        }
+        let mut line = format!("{marker}  {name}  {num}{size}{}", badges.join(&ui::dim(" · ")));
+        if detail {
+            if let Some(c) = ctx.refs.heads.get(&r.branch) {
+                line += &format!("  {}", ui::dim(&c.subject));
+            }
+        }
+        println!("{}", line.trim_end());
+    }
 }
 
 /// The diff of a stacked branch's own commit, or nothing for merged or
@@ -402,14 +515,20 @@ fn query_prs(ctx: &Ctx, queries: Vec<(String, PrQuery)>, strict: bool) -> Result
 pub fn log(stack_only: bool, offline: bool) -> Result<()> {
     let ctx = Ctx::new(false)?;
     let sis = stacks_to_show(&ctx, !stack_only);
-    if sis.is_empty() {
+    // Review branches belong to no stack, so only the full view shows them.
+    let show_reviews = !stack_only || ctx.info.current_branch.as_deref().is_none_or(|c| ctx.store.file.find(c).is_none());
+    if sis.is_empty() && (!show_reviews || ctx.reviews.is_empty()) {
         println!("No stacks. Start one with `gt create <name> -m <message>`.");
         return Ok(());
     }
     let prs = if offline {
         HashMap::new()
     } else {
-        match fetch_prs(&ctx, &sis, false) {
+        let mut queries: Vec<(String, PrQuery)> = sis.iter().flat_map(|&si| ctx.pr_queries(si, false)).collect();
+        if show_reviews {
+            queries.extend(ctx.reviews.iter().filter_map(|r| Some((r.branch.clone(), PrQuery::Number(r.pr?)))));
+        }
+        match query_prs(&ctx, queries, true) {
             Ok((_, m)) => m,
             Err(e) => {
                 ui::warn(&format!("couldn't load PR status: {e:#}"));
@@ -418,6 +537,9 @@ pub fn log(stack_only: bool, offline: bool) -> Result<()> {
         }
     };
     render_stacks(&ctx, &sis, &prs, !offline);
+    if show_reviews {
+        render_reviews(&ctx, &prs, !offline);
+    }
     Ok(())
 }
 
@@ -794,6 +916,53 @@ fn fetch(ctx: &Ctx, branches: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Refreshes what each review branch is compared against, never the branch
+/// itself. One fetch, then one per branch if that fails (a merged PR's head
+/// branch may be gone); failures only warn.
+fn fetch_reviews(ctx: &Ctx) {
+    let spec = |r: &Review| match r.fork_pr() {
+        Some(n) => format!("+refs/pull/{n}/head:{}", ctx.review_ref(r)),
+        None => format!("+refs/heads/{}:{}", r.branch, ctx.review_ref(r)),
+    };
+    let fetch = |specs: &[String]| {
+        let mut args = vec!["fetch", "--quiet", "--no-tags", ctx.remote.as_str()];
+        args.extend(specs.iter().map(String::as_str));
+        git::run_raw(None, &args, None, &[]).map(|o| o.ok).unwrap_or(false)
+    };
+    let specs: Vec<String> = ctx.reviews.iter().map(spec).collect();
+    if specs.is_empty() || fetch(&specs) {
+        return;
+    }
+    for (r, s) in ctx.reviews.iter().zip(&specs) {
+        if !fetch(std::slice::from_ref(s)) {
+            ui::warn(&format!("couldn't fetch the PR head of review branch {}", r.branch));
+        }
+    }
+}
+
+/// Moves each review branch to its PR head, whether the PR gained commits or
+/// was force-pushed. Local commits on it are dropped (the reflog keeps them);
+/// a checkout whose uncommitted changes are in the way is left alone.
+fn update_reviews(ctx: &Ctx) {
+    for r in &ctx.reviews {
+        let (Some(local), Some(tip)) = (ctx.refs.head(&r.branch), ctx.review_tip(r)) else { continue };
+        if local == tip {
+            continue;
+        }
+        let forced = !git::is_ancestor(local, tip);
+        if let Err(e) = ctx.set_branch(&r.branch, Some(local), tip) {
+            ui::warn(&format!("couldn't update review branch {}: {e:#}", r.branch));
+            continue;
+        }
+        let (old, new) = (ui::short(local), ui::short(tip));
+        ui::ok(&if forced {
+            format!("reset {} to the force-pushed PR head {new} (was {})", ui::bold(&r.branch), ui::dim(old))
+        } else {
+            format!("updated {} {} → {new}", ui::bold(&r.branch), ui::dim(old))
+        });
+    }
+}
+
 /// Force-pushes branches atomically, each leased against its last known remote sha.
 fn push(ctx: &Ctx, branches: &[String], no_verify: bool) -> Result<()> {
     if branches.is_empty() {
@@ -880,7 +1049,13 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
     let mut ctx = Ctx::new(true)?;
     let sis = stacks_to_show(&ctx, opts.all);
     if sis.is_empty() {
-        bail!("nothing to sync");
+        if ctx.reviews.is_empty() {
+            bail!("nothing to sync");
+        }
+        fetch_reviews(&ctx);
+        ctx.reload()?;
+        update_reviews(&ctx);
+        return Ok(());
     }
 
     // Merged branches are pruned from every stack, not just the ones being synced.
@@ -921,6 +1096,9 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         let trunks: Vec<String> = sis.iter().map(|&si| ctx.store.file.stacks[si].trunk.branch.clone()).collect();
         fetch(&ctx, &trunks)?;
     }
+    fetch_reviews(&ctx);
+    ctx.reload()?;
+    update_reviews(&ctx);
     ctx.reload()?;
 
     // 3. Delete local branches whose PRs merged, as long as the local head is
@@ -1458,12 +1636,14 @@ pub fn review(target: Option<String>) -> Result<()> {
 
     let sha = if cross {
         let n = pr.as_ref().unwrap().number;
-        let refspec = format!("refs/pull/{n}/head");
+        // Kept in a ref so `gt ls` can tell when the PR moves on.
+        let dest = ctx.review_ref(&Review { branch: name.clone(), pr: Some(n) });
+        let refspec = format!("+refs/pull/{n}/head:{dest}");
         let out = git::run_raw(None, &["fetch", "--quiet", "--no-tags", &ctx.remote, &refspec], None, &[])?;
         if !out.ok {
-            bail!("git fetch {refspec} failed: {}", out.stderr.trim());
+            bail!("git fetch refs/pull/{n}/head failed: {}", out.stderr.trim());
         }
-        git::rev_parse("FETCH_HEAD").ok_or_else(|| anyhow!("fetched {refspec} but FETCH_HEAD is missing"))?
+        git::rev_parse(&dest).ok_or_else(|| anyhow!("fetched refs/pull/{n}/head but {dest} is missing"))?
     } else {
         fetch(&ctx, &[head.clone()])?;
         ctx.reload()?;
@@ -1477,11 +1657,10 @@ pub fn review(target: Option<String>) -> Result<()> {
             ctx.set_branch(&name, Some(&l), &sha)?;
             ui::ok(&format!("updated {} {} → {}", ui::bold(&name), ui::dim(ui::short(&l)), ui::short(&sha)));
         }
-        Some(l) => ui::warn(&format!(
-            "local {name} ({}) isn't an ancestor of the PR head ({}); keeping it. Delete it and rerun to start over.",
-            ui::short(&l),
-            ui::short(&sha)
-        )),
+        Some(l) => {
+            ctx.set_branch(&name, Some(&l), &sha)?;
+            ui::ok(&format!("reset {} to the PR head {} (was {})", ui::bold(&name), ui::short(&sha), ui::dim(ui::short(&l))));
+        }
     }
     let marker = pr.as_ref().map(|p| p.number.to_string()).unwrap_or_else(|| "true".into());
     git::run(&["config", &review_key(&name), &marker])?;

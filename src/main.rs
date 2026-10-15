@@ -22,14 +22,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Show every local stack with PR, CI and review status
+    /// Show every local stack and review branch with PR, CI and review status
     #[command(visible_alias = "l")]
     Log {
         /// Only the stack containing the current branch
         #[arg(short, long)]
         stack: bool,
     },
-    /// Show every local stack, compactly, from local state only (no network)
+    /// Show every local stack and review branch, compactly, from local state only (no network)
     Ls {
         #[arg(short, long)]
         stack: bool,
@@ -83,7 +83,8 @@ enum Cmd {
     Squash,
     /// Continue after resolving a restack conflict
     Continue,
-    /// Fetch, mark merged PRs, pull in remote fixes, restack onto trunk, push
+    /// Fetch, mark merged PRs, pull in remote fixes, restack onto trunk, push.
+    /// Also moves review branches to their PR heads, overwriting local commits.
     #[command(visible_alias = "s")]
     Sync {
         #[arg(short, long)]
@@ -141,7 +142,8 @@ enum Cmd {
         #[arg(short = 'D', long)]
         include_diverged: bool,
     },
-    /// Check out a PR to review, frozen: `gt sync` never restacks, pushes or updates it.
+    /// Check out a PR to review, read-only: `gt sync` moves it to the PR head (even after a
+    /// force push, dropping local commits) but never restacks or pushes it.
     /// Without a target, pick from PRs where you're a requested reviewer (not via a team).
     #[command(visible_alias = "rv")]
     Review {
