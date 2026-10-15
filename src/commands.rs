@@ -277,21 +277,38 @@ fn branch_loc(ctx: &Ctx, stack: &Stack, idx: usize) -> Option<loc::Diff> {
         // No commit of its own yet.
         return Some(loc::Diff::empty(&c.sha));
     }
-    // Off the happy path (several commits, or not restacked), diff from the
-    // parent of the branch's oldest own commit so the size covers all of its
-    // work but none of what's below it (including work since squash-merged).
-    let base = match c.parents.first() {
-        Some(p) if parent_tips.contains(&Some(p.as_str())) => None,
-        _ => {
-            let own = git::own_commits(&c.sha, &below_heads(ctx, stack, idx)).ok()?;
-            match own.first() {
-                None => return Some(loc::Diff::empty(&c.sha)),
-                Some(oldest) if *oldest == c.sha => None,
-                Some(oldest) => Some(git::rev_parse(&format!("{oldest}^"))?),
-            }
-        }
+    match c.parents.first() {
+        Some(p) if parent_tips.contains(&Some(p.as_str())) => loc::of_commit(&ctx.info.common_dir, &c.sha, None).ok(),
+        // Off the happy path (several commits, or not restacked).
+        _ => own_loc(ctx, &c.sha, &below_heads(ctx, stack, idx)),
+    }
+}
+
+/// The diff of `tip`'s own commits, those not reachable from `below`, measured
+/// from the parent of the oldest one so the size covers all of its work but
+/// none of what's below it (including work since squash-merged).
+fn own_loc(ctx: &Ctx, tip: &str, below: &[String]) -> Option<loc::Diff> {
+    let own = git::own_commits(tip, below).ok()?;
+    let base = match own.first() {
+        None => return Some(loc::Diff::empty(tip)),
+        Some(oldest) if oldest == tip => None,
+        Some(oldest) => Some(git::rev_parse(&format!("{oldest}^"))?),
     };
-    loc::of_commit(&ctx.info.common_dir, &c.sha, base.as_deref()).ok()
+    loc::of_commit(&ctx.info.common_dir, tip, base.as_deref()).ok()
+}
+
+/// The diff of a branch no stack tracks: its own commits on top of trunk, local
+/// or remote, so neither a stale local trunk nor several commits skew it.
+fn untracked_loc(ctx: &Ctx, branch: &str, tip: &str) -> Result<loc::Diff> {
+    let trunk = ctx.default_trunk();
+    let below: Vec<String> = [ctx.remote_ref(&trunk), format!("refs/heads/{trunk}")]
+        .iter()
+        .filter_map(|r| git::rev_parse(r))
+        .collect();
+    if branch == trunk || below.is_empty() {
+        return loc::of_commit(&ctx.info.common_dir, tip, None);
+    }
+    own_loc(ctx, tip, &below).ok_or_else(|| anyhow!("couldn't size {branch}'s own commits against {trunk}"))
 }
 
 pub fn loc_cmd(target: Option<String>, json: bool) -> Result<()> {
@@ -308,7 +325,7 @@ pub fn loc_cmd(target: Option<String>, json: bool) -> Result<()> {
                         None => loc::of_commit(&ctx.info.common_dir, ctx.refs.head(&b).unwrap(), None)?,
                     }
                 }
-                None => loc::of_commit(&ctx.info.common_dir, ctx.refs.head(&b).unwrap(), None)?,
+                None => untracked_loc(&ctx, &b, ctx.refs.head(&b).unwrap())?,
             };
             (Some(b), diff)
         }
