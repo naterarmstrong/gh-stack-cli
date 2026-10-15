@@ -1351,6 +1351,128 @@ pub fn get(target: String) -> Result<()> {
 
 // ───────────────────────────── open ─────────────────────────────
 
+// ───────────────────────────── review ─────────────────────────────
+
+/// Git config key marking a branch pulled down by `gt review` (value: PR number).
+fn review_key(branch: &str) -> String {
+    format!("branch.{branch}.gtReview")
+}
+
+pub fn review(target: Option<String>) -> Result<()> {
+    let mut ctx = Ctx::new(false)?;
+    let (pr, head) = match target {
+        None => {
+            let prs = ctx.gh()?.review_requests()?;
+            if prs.is_empty() {
+                println!("No open PRs are waiting on your review.");
+                return Ok(());
+            }
+            let num_w = prs.iter().map(|p| p.number.to_string().len()).max().unwrap_or(0) + 1;
+            let items: Vec<picker::Item> = prs
+                .iter()
+                .map(|p| {
+                    let title: String = p.title.chars().take(70).collect();
+                    let mut badges = vec![ui::green(&format!("+{}", loc::human(p.additions as u32))), ui::red(&format!("−{}", loc::human(p.deletions as u32)))];
+                    if let Some(a) = &p.author {
+                        badges.push(ui::blue(&format!("by {}", a.login)));
+                    }
+                    if p.is_draft {
+                        badges.push(ui::dim("draft"));
+                    }
+                    picker::Item {
+                        text: format!("{:num_w$}  {title}  {}", format!("#{}", p.number), badges.join(" ")),
+                        // Filtering matches on the key, so include the title and branch.
+                        key: Some(format!("{}\t{} {}", p.number, p.title, p.head_ref_name)),
+                    }
+                })
+                .collect();
+            let picked = picker::pick("Review", &items, None)?.ok_or_else(|| anyhow!("cancelled"))?;
+            let n: u64 = picked.split('\t').next().unwrap().parse()?;
+            let pr = prs.into_iter().find(|p| p.number == n).unwrap();
+            let head = pr.head_ref_name.clone();
+            (Some(pr), head)
+        }
+        Some(t) => {
+            let query = match parse_pr(&t) {
+                Some(n) => PrQuery::Number(n),
+                None => PrQuery::Head(t.clone()),
+            };
+            match ctx.gh()?.review_pr(&query)? {
+                Some(pr) => {
+                    let head = pr.head_ref_name.clone();
+                    (Some(pr), head)
+                }
+                None if parse_pr(&t).is_some() => bail!("PR {t} not found"),
+                // A branch with no PR can still be pulled down frozen.
+                None => (None, t),
+            }
+        }
+    };
+
+    // Branches from forks don't exist on our remote; name them after the PR.
+    let cross = pr.as_ref().is_some_and(|p| p.is_cross_repository);
+    let name = match &pr {
+        Some(p) if cross => format!("pr/{}", p.number),
+        _ => head.clone(),
+    };
+    if ctx.store.file.find(&name).is_some() {
+        bail!("{name} is one of your stacked branches; use `gt co {name}`");
+    }
+    if let Some(p) = &pr {
+        let author = p.author.as_ref().map(|a| format!(" by {}", a.login)).unwrap_or_default();
+        ui::info(&format!("#{} {}{author}", p.number, ui::bold(&p.title)));
+        if p.state != "OPEN" {
+            ui::warn(&format!("#{} is {}", p.number, p.state.to_lowercase()));
+        }
+    }
+
+    let sha = if cross {
+        let n = pr.as_ref().unwrap().number;
+        let refspec = format!("refs/pull/{n}/head");
+        let out = git::run_raw(None, &["fetch", "--quiet", "--no-tags", &ctx.remote, &refspec], None, &[])?;
+        if !out.ok {
+            bail!("git fetch {refspec} failed: {}", out.stderr.trim());
+        }
+        git::rev_parse("FETCH_HEAD").ok_or_else(|| anyhow!("fetched {refspec} but FETCH_HEAD is missing"))?
+    } else {
+        fetch(&ctx, &[head.clone()])?;
+        ctx.reload()?;
+        ctx.refs.remote.get(&head).cloned().ok_or_else(|| anyhow!("{head} isn't on {}", ctx.remote))?
+    };
+
+    match ctx.refs.head(&name).map(str::to_string) {
+        None => ctx.set_branch(&name, None, &sha)?,
+        Some(l) if l == sha => {}
+        Some(l) if git::is_ancestor(&l, &sha) => {
+            ctx.set_branch(&name, Some(&l), &sha)?;
+            ui::ok(&format!("updated {} {} → {}", ui::bold(&name), ui::dim(ui::short(&l)), ui::short(&sha)));
+        }
+        Some(l) => ui::warn(&format!(
+            "local {name} ({}) isn't an ancestor of the PR head ({}); keeping it. Delete it and rerun to start over.",
+            ui::short(&l),
+            ui::short(&sha)
+        )),
+    }
+    let marker = pr.as_ref().map(|p| p.number.to_string()).unwrap_or_else(|| "true".into());
+    git::run(&["config", &review_key(&name), &marker])?;
+    if let Some(p) = &pr {
+        // What the GitHub Pull Requests extension (and its checkout) uses to tie
+        // a branch to its PR; fork branches have no upstream to match on.
+        let gh = ctx.gh()?;
+        let link = format!("{}#{}#{}", gh.owner, gh.repo, p.number);
+        git::run(&["config", &format!("branch.{name}.github-pr-owner-number"), &link])?;
+    }
+    ctx.reload()?;
+    if !cross {
+        ctx.ensure_upstreams([name.as_str()]);
+    }
+    if let Some(wt) = ctx.other_worktree(&name) {
+        ui::info(&format!("{name} is checked out in {}", wt.display()));
+        return Ok(());
+    }
+    checkout(&ctx, &name)
+}
+
 pub fn open(target: Option<String>) -> Result<()> {
     let ctx = Ctx::new(false)?;
     let branch = match target {

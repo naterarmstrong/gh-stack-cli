@@ -95,6 +95,29 @@ pub struct RemoteStack {
     pub pull_requests: Vec<RemoteStackPr>,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+pub struct Login {
+    pub login: String,
+}
+
+/// A PR as `gt review` needs it: enough to list it and fetch its head.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewPr {
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    pub is_draft: bool,
+    pub head_ref_name: String,
+    pub is_cross_repository: bool,
+    pub additions: u64,
+    pub deletions: u64,
+    pub author: Option<Login>,
+}
+
+const REVIEW_FIELDS: &str =
+    "number title state isDraft headRefName isCrossRepository additions deletions author { login }";
+
 pub enum PrQuery {
     Number(u64),
     Head(String),
@@ -196,6 +219,37 @@ impl Client {
             })
             .collect();
         Ok((repo["id"].as_str().unwrap_or_default().to_string(), results))
+    }
+
+    /// Open PRs in this repo where you're asked to review by name; requests
+    /// made to a team you're on (e.g. litellm-engineering) don't count.
+    pub fn review_requests(&self) -> Result<Vec<ReviewPr>> {
+        let search = format!(
+            "repo:{}/{} is:pr is:open archived:false user-review-requested:@me sort:updated-desc",
+            self.owner, self.repo
+        );
+        let q = format!(
+            "query {{ search(query: {}, type: ISSUE, first: 100) {{ nodes {{ ... on PullRequest {{ {REVIEW_FIELDS} }} }} }} }}",
+            json!(search)
+        );
+        let data = self.graphql(&q)?;
+        let nodes = data["search"]["nodes"].as_array().cloned().unwrap_or_default();
+        Ok(nodes.into_iter().filter_map(|n| serde_json::from_value(n).ok()).collect())
+    }
+
+    /// One PR by number, or the newest one for a head branch.
+    pub fn review_pr(&self, query: &PrQuery) -> Result<Option<ReviewPr>> {
+        let field = match query {
+            PrQuery::Number(n) => format!("pullRequest(number: {n}) {{ {REVIEW_FIELDS} }}"),
+            PrQuery::Head(h) => format!(
+                "pullRequests(headRefName: {}, first: 1, orderBy: {{field: CREATED_AT, direction: DESC}}) {{ nodes {{ {REVIEW_FIELDS} }} }}",
+                json!(h)
+            ),
+        };
+        let data = self.graphql(&format!("query {{ {} {{ pr: {field} }} }}", self.repo_selector()))?;
+        let v = &data["repository"]["pr"];
+        let v = if v.get("nodes").is_some() { &v["nodes"][0] } else { v };
+        Ok(if v.is_null() { None } else { serde_json::from_value(v.clone()).ok() })
     }
 
     pub fn stack_for_pr(&self, pr: u64) -> Result<Option<RemoteStack>> {

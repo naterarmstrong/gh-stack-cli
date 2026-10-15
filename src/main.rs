@@ -141,6 +141,13 @@ enum Cmd {
         #[arg(short = 'D', long)]
         include_diverged: bool,
     },
+    /// Check out a PR to review, frozen: `gt sync` never restacks, pushes or updates it.
+    /// Without a target, pick from PRs where you're a requested reviewer (not via a team).
+    #[command(visible_alias = "rv")]
+    Review {
+        /// Branch name, PR number, or PR URL
+        target: Option<String>,
+    },
     /// Lines changed by a branch's commit, per file, split into src/test/doc/gen
     Loc {
         /// Branch, PR number, or any commit (defaults to the current branch)
@@ -178,6 +185,7 @@ fn main() {
         Cmd::Track { branches, trunk } => commands::track(branches, trunk),
         Cmd::Delete { target, force } => commands::delete_upstack(target, force),
         Cmd::ClearMerged { force, include_diverged } => commands::clear_merged(force, include_diverged),
+        Cmd::Review { target } => commands::review(target),
         Cmd::Loc { target, json } => commands::loc_cmd(target, json),
         Cmd::Open { target } => commands::open(target),
     };
