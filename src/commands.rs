@@ -1,5 +1,6 @@
 use crate::ctx::Ctx;
 use crate::git;
+use crate::loc;
 use crate::picker;
 use crate::github::{MutationBatch, Pr, PrQuery};
 use crate::restack;
@@ -96,6 +97,9 @@ struct Cols {
     /// Reserve a PR-number column (only when some branch in the group has a PR).
     pr: bool,
     detail: bool,
+    /// Each branch's diff size as (plain, colored), and the widest plain one.
+    sizes: HashMap<String, (String, String)>,
+    size_width: usize,
 }
 
 fn branch_line(ctx: &Ctx, stack: &Stack, idx: usize, prs: &HashMap<String, Pr>, cols: &Cols) -> String {
@@ -132,7 +136,12 @@ fn branch_line(ctx: &Ctx, stack: &Stack, idx: usize, prs: &HashMap<String, Pr>, 
         }
     }
     let num = if num.is_empty() { num } else { format!("{num} ") };
-    let mut line = format!("{name}  {num}{}", badges.join(&ui::dim(" · ")));
+    let size = match cols.sizes.get(&b.branch) {
+        Some((plain, color)) => format!("{color}{}  ", " ".repeat(cols.size_width - plain.chars().count())),
+        None if cols.size_width > 0 => " ".repeat(cols.size_width + 2),
+        None => String::new(),
+    };
+    let mut line = format!("{name}  {num}{size}{}", badges.join(&ui::dim(" · ")));
     if cols.detail && !b.merged() {
         if let Some(c) = ctx.refs.heads.get(&b.branch) {
             line += &format!("  {}", ui::dim(&c.subject));
@@ -202,10 +211,17 @@ fn graph_rows(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bool)
         }
         let cols = stacks.len();
         let branches = || stacks.iter().flat_map(|s| &s.branches).filter(|b| shown(b));
+        let sizes: HashMap<String, (String, String)> = stacks
+            .iter()
+            .flat_map(|s| (0..s.branches.len()).map(move |i| (*s, i)))
+            .filter_map(|(s, i)| Some((s.branches[i].branch.clone(), loc::summary(&branch_loc(ctx, s, i)?.total))))
+            .collect();
         let layout = Cols {
             width: branches().map(|b| b.branch.len()).max().unwrap_or(0),
             pr: branches().any(|b| prs.contains_key(&b.branch) || b.pr_number().is_some()),
             detail,
+            size_width: sizes.values().map(|(p, _)| p.chars().count()).max().unwrap_or(0),
+            sizes,
         };
         for (col, stack) in stacks.iter().enumerate() {
             let rails = ui::dim(&"│ ".repeat(col));
@@ -236,6 +252,78 @@ fn graph_rows(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bool)
         });
     }
     rows
+}
+
+/// The diff of a stacked branch's own commit, or nothing for merged or
+/// missing branches (and when it can't be computed).
+fn branch_loc(ctx: &Ctx, stack: &Stack, idx: usize) -> Option<loc::Diff> {
+    let b = &stack.branches[idx];
+    if b.merged() {
+        return None;
+    }
+    let c = ctx.refs.heads.get(&b.branch)?;
+    let parent = stack.parent_of(idx);
+    let parent_tips = [ctx.refs.head(parent), ctx.refs.remote.get(parent).map(String::as_str)];
+    if parent_tips.contains(&Some(c.sha.as_str())) {
+        // No commit of its own yet.
+        return Some(loc::Diff::empty(&c.sha));
+    }
+    // Off the happy path (several commits, or not restacked), diff from where
+    // it forked so the size covers the whole PR, not just the last commit.
+    let base = match c.parents.first() {
+        Some(p) if parent_tips.contains(&Some(p.as_str())) => None,
+        first => parent_tips
+            .iter()
+            .flatten()
+            .find_map(|t| git::merge_base(t, &c.sha))
+            .filter(|mb| Some(mb) != first),
+    };
+    loc::of_commit(&ctx.info.common_dir, &c.sha, base.as_deref()).ok()
+}
+
+pub fn loc_cmd(target: Option<String>, json: bool) -> Result<()> {
+    let ctx = Ctx::new(false)?;
+    let target = target.or_else(|| ctx.info.current_branch.clone()).unwrap_or_else(|| "HEAD".into());
+    let (branch, diff) = match resolve_branch(&ctx, &target) {
+        Ok(b) => {
+            let diff = match ctx.store.file.find(&b) {
+                Some(si) => {
+                    let s = &ctx.store.file.stacks[si];
+                    let idx = s.branches.iter().position(|x| x.branch == b).unwrap();
+                    match branch_loc(&ctx, s, idx) {
+                        Some(d) => d,
+                        None => loc::of_commit(&ctx.info.common_dir, ctx.refs.head(&b).unwrap(), None)?,
+                    }
+                }
+                None => loc::of_commit(&ctx.info.common_dir, ctx.refs.head(&b).unwrap(), None)?,
+            };
+            (Some(b), diff)
+        }
+        Err(e) => match git::rev_parse(&target) {
+            Some(sha) => (None, loc::of_commit(&ctx.info.common_dir, &sha, None)?),
+            None => return Err(e),
+        },
+    };
+    if json {
+        let mut v = serde_json::to_value(&diff)?;
+        v["version"] = 1.into();
+        v["branch"] = branch.into();
+        println!("{}", serde_json::to_string(&v)?);
+        return Ok(());
+    }
+    let (_, total) = loc::summary(&diff.total);
+    let name = branch.unwrap_or_else(|| ui::short(&diff.commit).to_string());
+    println!("{}  {}", ui::bold(&name), if total.is_empty() { ui::dim("no changes") } else { total });
+    let width = diff.files.iter().map(|f| f.path.chars().count()).max().unwrap_or(0);
+    for f in &diff.files {
+        let (_, size) = loc::summary(&f.lines);
+        let size = if f.binary { ui::dim("binary") } else { size };
+        let path = format!("{:width$}", f.path);
+        let path = if f.kind == loc::Kind::Src { path } else { ui::dim(&path) };
+        let from = f.old_path.as_ref().map(|o| ui::dim(&format!("  (from {o})"))).unwrap_or_default();
+        println!("  {} {path}  {size}{from}", ui::dim(&f.status));
+    }
+    Ok(())
 }
 
 fn stacks_to_show(ctx: &Ctx, all: bool) -> Vec<usize> {

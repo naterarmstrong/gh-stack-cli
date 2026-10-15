@@ -2,6 +2,7 @@ mod commands;
 mod ctx;
 mod git;
 mod github;
+mod loc;
 mod picker;
 mod restack;
 mod state;
@@ -140,6 +141,14 @@ enum Cmd {
         #[arg(short = 'D', long)]
         include_diverged: bool,
     },
+    /// Lines changed by a branch's commit, per file, split into src/test/doc/gen
+    Loc {
+        /// Branch, PR number, or any commit (defaults to the current branch)
+        target: Option<String>,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
     /// Open a branch's PR in the browser
     #[command(visible_alias = "pr")]
     Open { target: Option<String> },
@@ -169,6 +178,7 @@ fn main() {
         Cmd::Track { branches, trunk } => commands::track(branches, trunk),
         Cmd::Delete { target, force } => commands::delete_upstack(target, force),
         Cmd::ClearMerged { force, include_diverged } => commands::clear_merged(force, include_diverged),
+        Cmd::Loc { target, json } => commands::loc_cmd(target, json),
         Cmd::Open { target } => commands::open(target),
     };
     if let Err(e) = res {
