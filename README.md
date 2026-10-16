@@ -69,16 +69,19 @@ Aliases are in parentheses.
 | `gt modify` (`m`) | Amend the current branch's commit (or make the first one if the branch has none), then restack everything above it. `-a` stages everything, `-m` replaces the message. |
 | `gt restack` (`r`) | Rebase each branch onto its parent, in memory. `--trunk` also moves the bottom branch onto the latest remote trunk. |
 | `gt squash` | Fold each branch in the stack down to one commit. The content stays the same. |
-| `gt continue` | Carry on after you resolve a restack conflict (finishes a `git rebase` in progress first). |
+| `gt continue` | Carry on after you resolve a restack conflict (finishes a `git rebase` in progress first). Once the whole stack is restacked, it checks out the branch you were on when the conflict started. |
+| `gt abort` | Give up on a restack conflict: aborts the `git rebase`, marks the branch as needing a rebase, and checks out the branch you were on. Branches below it that already restacked cleanly stay restacked. |
 
 ### Syncing with GitHub
 
 | Command | What it does |
 | --- | --- |
 | `gt submit` (`ss`) | Restack, push, create PRs (title and body from the commit message) or retarget them onto the right base, and link the stack on GitHub. `--draft` opens new PRs as drafts. `--relink` replaces the GitHub stack if it doesn't match the local order. |
-| `gt sync` (`s`) | Fetch, mark merged PRs, pull in commits others pushed to your branches, fast-forward local trunks (including ones checked out in other worktrees), restack onto trunk, and push branches that already exist on the remote. See flags below. |
+| `gt sync` (`s`) | Fetch, mark merged PRs, pull in commits others pushed to your branches, fast-forward local trunks (including ones checked out in other worktrees), restack onto trunk, and push branches that already exist on the remote. A branch that would conflict is left where it is and marked **needs rebase** in `gt log`/`gt ls`; the branches above it are restacked onto it. Sync never stops for a conflict or checks out a branch. See flags below. |
 | `gt get <target>` | Pull down a stack from GitHub by PR number, URL or branch. |
 | `gt track [branches…]` | Start tracking existing branches (bottom first) as a stack. Defaults to the current branch. `--trunk` sets the trunk. |
+
+To fix a branch that sync skipped, run `gt checkout <branch> && gt restack --trunk`. That starts a normal `git rebase` you can finish with `gt continue` or back out of with `gt abort`. The mark is stored as `branch.<name>.gtNeedsRebase` in git config and clears once the branch restacks cleanly.
 
 `gt sync` flags:
 

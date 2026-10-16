@@ -23,18 +23,26 @@ pub struct Conflict {
 
 pub struct Plan {
     pub updates: Vec<Update>,
-    pub conflict: Option<Conflict>,
+    pub conflicts: Vec<Conflict>,
+    /// Branches that were checked and replay cleanly (moved or not).
+    pub clean: Vec<String>,
 }
 
 /// Computes new commits for every unmerged branch in stack `si`. When
 /// `onto_trunk` is set the bottom branch moves onto the remote trunk tip;
 /// otherwise it stays where it is and only the branches above it move.
-pub fn plan(ctx: &Ctx, si: usize, onto_trunk: bool) -> Result<Plan> {
+///
+/// By default planning stops at the first conflict. With `skip_conflicts` a
+/// conflicting branch is left where it is and the branches above it are
+/// replayed onto it instead.
+pub fn plan(ctx: &Ctx, si: usize, onto_trunk: bool, skip_conflicts: bool) -> Result<Plan> {
     let stack = &ctx.store.file.stacks[si];
     let mut parent: Option<(String, String)> =
         if onto_trunk { Some((stack.trunk.branch.clone(), ctx.trunk_tip(&stack.trunk.branch)?)) } else { None };
     let mut old_parent_head: Option<String> = None;
     let mut updates = vec![];
+    let mut conflicts = vec![];
+    let mut clean = vec![];
     let mut below = below_seed(ctx, stack);
 
     for b in stack.branches.iter() {
@@ -45,6 +53,7 @@ pub fn plan(ctx: &Ctx, si: usize, onto_trunk: bool) -> Result<Plan> {
         let Some(c) = ctx.refs.heads.get(&b.branch) else {
             bail!("branch {} is in the stack but missing locally (try `gt get` or `gt sync`)", b.branch);
         };
+        below.extend(ctx.rebase_base(&b.branch).map(str::to_string));
         let Some((parent_name, parent_tip)) = parent.clone() else {
             below.extend([b.head.clone(), c.sha.clone()]);
             parent = Some((b.branch.clone(), c.sha.clone()));
@@ -75,20 +84,26 @@ pub fn plan(ctx: &Ctx, si: usize, onto_trunk: bool) -> Result<Plan> {
                 match git::merge_tree(base, &parent_tip, &c.sha)? {
                     Merge::Clean(tree) => git::commit_tree(&tree, &parent_tip, &git::commit_meta(&c.sha)?)?,
                     Merge::Conflict(files) => {
-                        return Ok(Plan {
-                            updates,
-                            conflict: Some(Conflict {
-                                branch: b.branch.clone(),
-                                onto: parent_tip,
-                                onto_name: parent_name,
-                                base: base.clone(),
-                                files,
-                            }),
+                        conflicts.push(Conflict {
+                            branch: b.branch.clone(),
+                            onto: parent_tip,
+                            onto_name: parent_name,
+                            base: base.clone(),
+                            files,
                         });
+                        if !skip_conflicts {
+                            return Ok(Plan { updates, conflicts, clean });
+                        }
+                        // Leave it where it is; the branches above follow it there.
+                        below.extend([b.head.clone(), c.sha.clone()]);
+                        old_parent_head = Some(c.sha.clone());
+                        parent = Some((b.branch.clone(), c.sha.clone()));
+                        continue;
                     }
                 }
             }
         };
+        clean.push(b.branch.clone());
         if new != c.sha {
             updates.push(Update { branch: b.branch.clone(), old: c.sha.clone(), new: new.clone() });
         }
@@ -96,7 +111,7 @@ pub fn plan(ctx: &Ctx, si: usize, onto_trunk: bool) -> Result<Plan> {
         old_parent_head = Some(c.sha.clone());
         parent = Some((b.branch.clone(), new));
     }
-    Ok(Plan { updates, conflict: None })
+    Ok(Plan { updates, conflicts, clean })
 }
 
 /// Commits that can never belong to a stacked branch: the trunk, local and remote.
@@ -126,6 +141,7 @@ pub fn squash(ctx: &Ctx, si: usize) -> Result<Vec<Update>> {
         let Some(c) = ctx.refs.heads.get(&b.branch) else {
             bail!("branch {} is in the stack but missing locally", b.branch);
         };
+        below.extend(ctx.rebase_base(&b.branch).map(str::to_string));
         let own = git::own_commits(&c.sha, &below)?;
         let new_parent = match &parent {
             None => git::merge_base(&c.sha, &trunk_tip)
@@ -190,15 +206,46 @@ pub fn record_heads(ctx: &mut Ctx) {
 /// Runs a full restack. On conflict, applies everything below it and leaves
 /// the conflicting branch mid-rebase so the user can resolve it.
 pub fn run(ctx: &mut Ctx, si: usize, onto_trunk: bool) -> Result<bool> {
-    let plan = plan(ctx, si, onto_trunk)?;
+    let plan = plan(ctx, si, onto_trunk, false)?;
     apply(ctx, &plan.updates)?;
-    match plan.conflict {
+    clear_marks(ctx, &plan.clean);
+    match plan.conflicts.first() {
         None => Ok(true),
         Some(c) => {
-            start_conflict(ctx, &c)?;
+            start_conflict(ctx, c)?;
             Ok(false)
         }
     }
+}
+
+/// Restacks everything that replays cleanly and leaves each conflicting
+/// branch where it is, marked as needing a rebase. Returns the skipped branches.
+pub fn run_skipping(ctx: &mut Ctx, si: usize, onto_trunk: bool) -> Result<Vec<String>> {
+    let plan = plan(ctx, si, onto_trunk, true)?;
+    apply(ctx, &plan.updates)?;
+    clear_marks(ctx, &plan.clean);
+    for c in &plan.conflicts {
+        ctx.mark_needs_rebase(&c.branch)?;
+        ui::warn(&format!(
+            "skipped {}: it conflicts with {} in\n{}",
+            ui::bold(&c.branch),
+            ui::bold(&c.onto_name),
+            c.files.iter().map(|f| format!("    {}", ui::red(f))).collect::<Vec<_>>().join("\n")
+        ));
+    }
+    Ok(plan.conflicts.into_iter().map(|c| c.branch).collect())
+}
+
+fn clear_marks(ctx: &mut Ctx, branches: &[String]) {
+    for b in branches {
+        ctx.clear_needs_rebase(b);
+    }
+}
+
+/// Where `start_conflict` notes the branch to return to on `gt abort`, and
+/// the branch being rebased: `<git-dir>/gt-rebase`, one name per line.
+pub fn abort_file(git_dir: &std::path::Path) -> std::path::PathBuf {
+    git_dir.join("gt-rebase")
 }
 
 fn start_conflict(ctx: &mut Ctx, c: &Conflict) -> Result<()> {
@@ -225,10 +272,12 @@ fn start_conflict(ctx: &mut Ctx, c: &Conflict) -> Result<()> {
         );
         return Ok(());
     }
-    if ctx.info.current_branch.as_deref() != Some(&c.branch) {
+    let orig = ctx.info.current_branch.clone().unwrap_or_default();
+    std::fs::write(abort_file(&ctx.info.git_dir), format!("{orig}\n{}\n", c.branch))?;
+    if orig != c.branch {
         git::run(&["checkout", "--quiet", &c.branch])?;
     }
     git::run_raw(None, &["rebase", "--onto", &c.onto, &c.base], None, &[])?;
-    eprintln!("\nResolve the conflicts, `git add` them, then run `gt continue`.");
+    eprintln!("\nResolve the conflicts, `git add` them, then run `gt continue` (or `gt abort` to give up).");
     Ok(())
 }

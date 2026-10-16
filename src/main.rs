@@ -81,9 +81,13 @@ enum Cmd {
     },
     /// Fold each branch in the stack down to one commit (content unchanged)
     Squash,
-    /// Continue after resolving a restack conflict
+    /// Continue after resolving a restack conflict; returns you to where you started once done
     Continue,
+    /// Abort a conflicted restack: undo the `git rebase`, mark the branch as needing a
+    /// rebase, and return to the branch you were on
+    Abort,
     /// Fetch, mark merged PRs, pull in remote fixes, restack onto trunk, push.
+    /// Branches that conflict are left in place and marked as needing a rebase.
     /// Also moves review branches to their PR heads, overwriting local commits.
     #[command(visible_alias = "s")]
     Sync {
@@ -179,6 +183,7 @@ fn main() {
         Cmd::Restack { trunk } => commands::restack_cmd(trunk),
         Cmd::Squash => commands::squash_cmd(),
         Cmd::Continue => commands::continue_cmd(),
+        Cmd::Abort => commands::abort_cmd(),
         Cmd::Sync { all, no_push, no_prune, prefer_remote, offline, no_verify } => {
             commands::sync(commands::SyncOpts { all, no_push, no_prune, prefer_remote, offline, no_verify })
         }

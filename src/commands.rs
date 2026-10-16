@@ -54,6 +54,9 @@ fn local_badges(ctx: &Ctx, stack: &Stack, idx: usize) -> Vec<String> {
     let b = &stack.branches[idx];
     let Some(c) = ctx.refs.heads.get(&b.branch) else { return vec![ui::red("missing locally")] };
     let mut out = vec![];
+    if ctx.needs_rebase(&b.branch) {
+        out.push(ui::red("needs rebase"));
+    }
     let parent = stack.parent_of(idx);
     let parent_tip = if parent == stack.trunk.branch {
         ctx.refs.remote.get(parent).or(ctx.refs.heads.get(parent).map(|c| &c.sha))
@@ -61,7 +64,7 @@ fn local_badges(ctx: &Ctx, stack: &Stack, idx: usize) -> Vec<String> {
         ctx.refs.heads.get(parent).map(|c| &c.sha)
     };
     if let Some(p) = parent_tip {
-        if c.parents.first() != Some(p) && c.sha != *p {
+        if c.parents.first() != Some(p) && c.sha != *p && !ctx.needs_rebase(&b.branch) {
             // Only off the happy path: count the branch's own commits (one git call).
             let own = git::own_commits(&c.sha, &below_heads(ctx, stack, idx)).map(|v| v.len()).unwrap_or(1);
             out.push(if own > 1 {
@@ -95,7 +98,9 @@ fn below_heads(ctx: &Ctx, stack: &Stack, idx: usize) -> Vec<String> {
     for lower in &stack.branches[..idx] {
         below.push(lower.head.clone());
         below.extend(ctx.refs.head(&lower.branch).map(str::to_string));
+        below.extend(ctx.rebase_base(&lower.branch).map(str::to_string));
     }
+    below.extend(ctx.rebase_base(&stack.branches[idx].branch).map(str::to_string));
     below
 }
 
@@ -784,8 +789,8 @@ pub fn modify(all: bool, message: Option<String>) -> Result<()> {
 pub fn restack_cmd(onto_trunk: bool) -> Result<()> {
     let mut ctx = Ctx::new(true)?;
     let si = ctx.current_stack()?;
-    let plan = restack::plan(&ctx, si, onto_trunk)?;
-    if plan.updates.is_empty() && plan.conflict.is_none() {
+    let plan = restack::plan(&ctx, si, onto_trunk, false)?;
+    if plan.updates.is_empty() && plan.conflicts.is_empty() {
         ui::ok("stack is already restacked");
         return Ok(());
     }
@@ -808,6 +813,9 @@ pub fn squash_cmd() -> Result<()> {
 
 pub fn continue_cmd() -> Result<()> {
     let git_dir = git::repo_info(&git::open()?)?.git_dir;
+    let note = restack::abort_file(&git_dir);
+    // The branch the restack started from, to return to once the stack is done.
+    let orig = std::fs::read_to_string(&note).ok().and_then(|s| s.lines().next().map(str::to_string));
     if git::rebase_in_progress(&git_dir) {
         let ok = std::process::Command::new(git::git_bin())
             .args(["rebase", "--continue"])
@@ -815,17 +823,62 @@ pub fn continue_cmd() -> Result<()> {
             .status()?
             .success();
         if !ok {
-            bail!("rebase still has conflicts; resolve, `git add`, and run `gt continue` again");
+            bail!("rebase still has conflicts; resolve, `git add`, and run `gt continue` again (or `gt abort`)");
         }
     }
+    let _ = std::fs::remove_file(&note);
     let mut ctx = Ctx::new(true)?;
     let si = ctx.current_stack()?;
     let clean = restack::run(&mut ctx, si, false)?;
     ctx.save()?;
-    if clean {
-        ui::ok("stack restacked");
+    let orig = orig.filter(|o| !o.is_empty());
+    if !clean {
+        // A further conflict noted the branch it was on; keep pointing at the first one.
+        if let (Some(o), Ok(text)) = (&orig, std::fs::read_to_string(&note)) {
+            let rest: Vec<&str> = text.lines().skip(1).collect();
+            std::fs::write(&note, format!("{o}\n{}\n", rest.join("\n")))?;
+        }
+        std::process::exit(1);
     }
-    exit_on_conflict(clean)
+    ui::ok("stack restacked");
+    if let Some(o) = orig {
+        if ctx.info.current_branch.as_deref() != Some(o.as_str()) && ctx.refs.heads.contains_key(&o) {
+            if let Err(e) = checkout(&ctx, &o) {
+                ui::warn(&format!("couldn't return to {o}: {e:#}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Gives up on a restack conflict: aborts the `git rebase`, marks the branch
+/// as needing a rebase, and goes back to the branch you were on. Branches
+/// below it that already restacked cleanly stay restacked.
+pub fn abort_cmd() -> Result<()> {
+    let git_dir = git::repo_info(&git::open()?)?.git_dir;
+    let note = std::fs::read_to_string(restack::abort_file(&git_dir)).unwrap_or_default();
+    let mut lines = note.lines();
+    let (orig, branch) = (lines.next().unwrap_or(""), lines.next().unwrap_or(""));
+    if !git::rebase_in_progress(&git_dir) {
+        let _ = std::fs::remove_file(restack::abort_file(&git_dir));
+        bail!("no rebase in progress");
+    }
+    if !git::run_interactive(None, &["rebase", "--abort"])? {
+        bail!("git rebase --abort failed");
+    }
+    let _ = std::fs::remove_file(restack::abort_file(&git_dir));
+    let mut ctx = Ctx::new(false)?;
+    let branch = if branch.is_empty() { ctx.info.current_branch.clone().unwrap_or_default() } else { branch.into() };
+    if !branch.is_empty() {
+        ctx.mark_needs_rebase(&branch)?;
+        ui::ok(&format!("aborted restacking {}; marked it as needing a rebase", ui::bold(&branch)));
+    }
+    if !orig.is_empty() && ctx.info.current_branch.as_deref() != Some(orig) && ctx.refs.heads.contains_key(orig) {
+        if let Err(e) = checkout(&ctx, orig) {
+            ui::warn(&format!("couldn't return to {orig}: {e:#}"));
+        }
+    }
+    Ok(())
 }
 
 // ───────────────────────────── track ─────────────────────────────
@@ -1197,18 +1250,20 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
     }
     ctx.reload()?;
 
-    // 6. Restack every stack onto its updated trunk. A stack that can't be
-    // restacked (e.g. multi-commit branches) is skipped, not fatal.
+    // 6. Restack every stack onto its updated trunk. A branch that conflicts
+    // is left where it is and marked as needing a rebase; the branches above
+    // it are restacked onto it. A stack that can't be restacked at all (e.g.
+    // multi-commit branches) is skipped, not fatal.
     let mut restacked = vec![];
+    let mut skipped = vec![];
     for &si in &sis {
         if ctx.store.file.stacks[si].fully_merged() {
             continue;
         }
-        match restack::run(&mut ctx, si, true) {
-            Ok(true) => restacked.push(si),
-            Ok(false) => {
-                ctx.save()?;
-                std::process::exit(1);
+        match restack::run_skipping(&mut ctx, si, true) {
+            Ok(s) => {
+                restacked.push(si);
+                skipped.extend(s);
             }
             Err(e) => ui::warn(&format!(
                 "not restacking or pushing the stack on {}: {e:#}",
@@ -1235,6 +1290,12 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         ui::ok(&format!("stack on {} is fully merged", ctx.store.file.stacks[si].trunk.branch));
     }
     render_stacks(&ctx, &live, &prs, true);
+    if !skipped.is_empty() {
+        eprintln!(
+            "\n{} need a rebase. To resolve one: `gt checkout <branch> && gt restack --trunk`.",
+            skipped.iter().map(|b| ui::bold(b)).collect::<Vec<_>>().join(", ")
+        );
+    }
     Ok(())
 }
 

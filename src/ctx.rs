@@ -50,6 +50,18 @@ fn reviews(repo: &gix::Repository) -> Vec<Review> {
     v
 }
 
+/// Branches `gt sync` couldn't restack cleanly, marked by `branch.<b>.gtNeedsRebase`
+/// (value: the branch's tip at the time). A mark only counts while the tip is unchanged.
+fn rebase_marks(repo: &gix::Repository) -> HashMap<String, String> {
+    let cfg = repo.config_snapshot();
+    cfg.plumbing()
+        .sections_by_name("branch")
+        .into_iter()
+        .flatten()
+        .filter_map(|s| Some((s.header().subsection_name()?.to_string(), s.value("gtNeedsRebase")?.to_string())))
+        .collect()
+}
+
 /// Each tracked branch's configured upstream: (branch.<b>.remote, branch.<b>.merge).
 fn upstreams(repo: &gix::Repository, branches: &HashSet<String>) -> HashMap<String, (String, String)> {
     let cfg = repo.config_snapshot();
@@ -66,6 +78,7 @@ pub struct Ctx {
     pub worktrees: HashMap<String, PathBuf>,
     /// Review branches that still exist locally.
     pub reviews: Vec<Review>,
+    rebase_marks: HashMap<String, String>,
     upstreams: HashMap<String, (String, String)>,
     lock: Option<Lock>,
     gh: OnceCell<Client>,
@@ -86,7 +99,8 @@ impl Ctx {
         reviews.retain(|r| refs.heads.contains_key(&r.branch));
         let worktrees = git::worktrees(&info.common_dir);
         let upstreams = upstreams(&repo, &tracked);
-        Ok(Ctx { info, store, remote, refs, worktrees, reviews, upstreams, lock, gh: OnceCell::new() })
+        let rebase_marks = rebase_marks(&repo);
+        Ok(Ctx { info, store, remote, refs, worktrees, reviews, rebase_marks, upstreams, lock, gh: OnceCell::new() })
     }
 
     pub fn gh(&self) -> Result<&Client> {
@@ -114,7 +128,37 @@ impl Ctx {
         self.reviews = reviews;
         self.worktrees = git::worktrees(&self.info.common_dir);
         self.upstreams = upstreams(&repo, &tracked);
+        self.rebase_marks = rebase_marks(&repo);
         Ok(())
+    }
+
+    /// Whether `gt sync` skipped this branch on a conflict and it hasn't moved since.
+    pub fn needs_rebase(&self, branch: &str) -> bool {
+        self.rebase_marks.get(branch).is_some_and(|sha| self.refs.head(branch) == Some(sha.as_str()))
+    }
+
+    /// The commit a marked branch still sits on: its parent's tip from before the
+    /// parent was restacked. It belongs below the branch and everything above it.
+    pub fn rebase_base(&self, branch: &str) -> Option<&str> {
+        if !self.needs_rebase(branch) {
+            return None;
+        }
+        self.refs.heads.get(branch)?.parents.first().map(String::as_str)
+    }
+
+    /// Marks `branch` as needing a hand rebase, at its current tip.
+    pub fn mark_needs_rebase(&mut self, branch: &str) -> Result<()> {
+        let Some(tip) = self.refs.head(branch).map(str::to_string) else { return Ok(()) };
+        git::run(&["config", &format!("branch.{branch}.gtNeedsRebase"), &tip])?;
+        self.rebase_marks.insert(branch.to_string(), tip);
+        Ok(())
+    }
+
+    /// Drops a branch's needs-rebase mark, if it has one.
+    pub fn clear_needs_rebase(&mut self, branch: &str) {
+        if self.rebase_marks.remove(branch).is_some() {
+            let _ = git::run(&["config", "--unset", &format!("branch.{branch}.gtNeedsRebase")]);
+        }
     }
 
     /// Points each branch's upstream at the same-named branch on the remote,
