@@ -59,6 +59,17 @@ pub fn warn(msg: &str) {
     eprintln!("{} {msg}", yellow("!"));
 }
 
+/// `3h ago`, `12d ago`.
+pub fn ago(t: std::time::SystemTime) -> String {
+    let s = t.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    match s {
+        0..60 => "just now".into(),
+        60..3600 => format!("{}m ago", s / 60),
+        3600..86400 => format!("{}h ago", s / 3600),
+        _ => format!("{}d ago", s / 86400),
+    }
+}
+
 pub fn short(sha: &str) -> &str {
     &sha[..sha.len().min(8)]
 }

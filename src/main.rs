@@ -2,6 +2,7 @@ mod commands;
 mod ctx;
 mod git;
 mod github;
+mod history;
 mod loc;
 mod picker;
 mod restack;
@@ -162,9 +163,62 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// A branch's commit, version by version, from its reflog: list the versions,
+    /// diff them, or put the branch back on an earlier one
+    #[command(visible_alias = "h", args_conflicts_with_subcommands = true)]
+    History {
+        #[command(subcommand)]
+        action: Option<HistoryCmd>,
+        /// Branch or PR number (defaults to the current branch)
+        branch: Option<String>,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
     /// Open a branch's PR in the browser
     #[command(visible_alias = "pr")]
     Open { target: Option<String> },
+}
+
+/// Versions are named `p3` or `3`; any commit works too.
+#[derive(Subcommand)]
+enum HistoryCmd {
+    /// What a version changed over its own base (the PR as of that version)
+    Show {
+        version: String,
+        /// Branch or PR number (defaults to the current branch)
+        #[arg(short, long)]
+        branch: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// What changed from one version to another, even across restacks.
+    /// Defaults to the previous version against the current one; `base` is the other side's parent
+    Compare {
+        from: Option<String>,
+        to: Option<String>,
+        #[arg(short, long)]
+        branch: Option<String>,
+        /// Endpoints, trees and changed files instead of a diff
+        #[arg(long)]
+        json: bool,
+    },
+    /// Put the branch, or only the paths after `--`, back on an earlier version,
+    /// then restack. The revert is itself a version, so it can be undone the same way
+    Revert {
+        version: String,
+        #[arg(short, long)]
+        branch: Option<String>,
+        /// Take the version exactly as it was (its old base, or its files verbatim)
+        /// instead of re-applying it onto the branch's current base
+        #[arg(long)]
+        exact: bool,
+        /// Don't ask for confirmation
+        #[arg(short, long)]
+        yes: bool,
+        #[arg(last = true)]
+        paths: Vec<String>,
+    },
 }
 
 fn main() {
@@ -195,6 +249,16 @@ fn main() {
         Cmd::Review { target } => commands::review(target),
         Cmd::Loc { target, json } => commands::loc_cmd(target, json),
         Cmd::Open { target } => commands::open(target),
+        Cmd::History { action, branch, json } => match action {
+            None => commands::history_list(branch, json),
+            Some(HistoryCmd::Show { version, branch, json }) => {
+                commands::history_compare(Some("base".into()), Some(version), branch, json)
+            }
+            Some(HistoryCmd::Compare { from, to, branch, json }) => commands::history_compare(from, to, branch, json),
+            Some(HistoryCmd::Revert { version, branch, exact, yes, paths }) => {
+                commands::history_revert(version, branch, exact, yes, paths)
+            }
+        },
     };
     if let Err(e) = res {
         eprintln!("{} {e:#}", ui::red("error:"));

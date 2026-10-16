@@ -240,9 +240,11 @@ impl Ctx {
     }
 
     /// Move a branch to `new`, keeping any worktree that has it checked out in step.
-    pub fn set_branch(&self, branch: &str, old: Option<&str>, new: &str) -> Result<()> {
+    /// `reason` heads the reflog entry (`gt history` reads it back as the action).
+    pub fn set_branch(&self, branch: &str, old: Option<&str>, new: &str, reason: &str) -> Result<()> {
         if let Some(wt) = self.worktrees.get(branch) {
-            let out = git::run_raw(Some(wt), &["reset", "--keep", "--quiet", new], None, &[])?;
+            let out =
+                git::run_raw(Some(wt), &["reset", "--keep", "--quiet", new], None, &[("GIT_REFLOG_ACTION", reason)])?;
             if !out.ok {
                 bail!(
                     "couldn't move {branch} in worktree {} (local changes in the way?): {}",
@@ -256,7 +258,7 @@ impl Ctx {
             return Ok(());
         }
         let refname = format!("refs/heads/{branch}");
-        let mut args = vec!["update-ref", "-m", "gt", refname.as_str(), new];
+        let mut args = vec!["update-ref", "-m", reason, refname.as_str(), new];
         if let Some(o) = old {
             args.push(o);
         }

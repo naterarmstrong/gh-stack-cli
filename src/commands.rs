@@ -1,6 +1,7 @@
 use crate::ctx::{Ctx, Review};
 use crate::git;
 use crate::github::{MutationBatch, Pr, PrQuery};
+use crate::history;
 use crate::loc;
 use crate::picker;
 use crate::restack;
@@ -316,19 +317,9 @@ fn trunk_badge(ctx: &Ctx, trunk: &str) -> Option<String> {
         },
     };
     Some(match git::last_fetch(&ctx.info.common_dir) {
-        Some(t) => format!("{status} {}", ui::dim(&format!("(fetched {})", ago(t)))),
+        Some(t) => format!("{status} {}", ui::dim(&format!("(fetched {})", ui::ago(t)))),
         None => status,
     })
-}
-
-fn ago(t: std::time::SystemTime) -> String {
-    let s = t.elapsed().map(|d| d.as_secs()).unwrap_or(0);
-    match s {
-        0..60 => "just now".into(),
-        60..3600 => format!("{}m ago", s / 60),
-        3600..86400 => format!("{}h ago", s / 3600),
-        _ => format!("{}d ago", s / 86400),
-    }
 }
 
 /// How a review branch compares with its PR head as of the last fetch. `gt
@@ -1033,7 +1024,7 @@ fn update_reviews(ctx: &Ctx) {
             continue;
         }
         let forced = !git::is_ancestor(local, tip);
-        if let Err(e) = ctx.set_branch(&r.branch, Some(local), tip) {
+        if let Err(e) = ctx.set_branch(&r.branch, Some(local), tip, "gt sync: review branch to PR head") {
             ui::warn(&format!("couldn't update review branch {}: {e:#}", r.branch));
             continue;
         }
@@ -1098,7 +1089,7 @@ fn adopt_remote(ctx: &Ctx, branch: &str, parent_ref: &str) -> Result<()> {
         let meta_src = local.as_ref().map(|l| l.sha.clone()).unwrap_or_else(|| remote.clone());
         git::commit_tree(&git::tree_of(&remote)?, &base, &git::commit_meta(&meta_src)?)?
     };
-    ctx.set_branch(branch, local.as_ref().map(|l| l.sha.as_str()), &new)?;
+    ctx.set_branch(branch, local.as_ref().map(|l| l.sha.as_str()), &new, "gt sync: pull remote")?;
     ui::ok(&format!("pulled remote changes into {}", ui::bold(branch)));
     Ok(())
 }
@@ -1237,7 +1228,7 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         }
         let (l, r) = (l.to_string(), r.clone());
         match ctx.worktrees.get(&trunk) {
-            None => ctx.set_branch(&trunk, Some(&l), &r)?,
+            None => ctx.set_branch(&trunk, Some(&l), &r, "gt sync: fast-forward trunk")?,
             Some(wt) => {
                 let out = git::run_raw(Some(wt), &["merge", "--ff-only", "--quiet", &r], None, &[])?;
                 if !out.ok {
@@ -1627,9 +1618,9 @@ pub fn get(target: String) -> Result<()> {
         if !merged {
             let remote = ctx.refs.remote.get(head).cloned().ok_or_else(|| anyhow!("{head} missing after fetch"))?;
             match ctx.refs.head(head).map(str::to_string) {
-                None => ctx.set_branch(head, None, &remote)?,
+                None => ctx.set_branch(head, None, &remote, "gt get")?,
                 Some(l) if l == remote => {}
-                Some(l) if git::is_ancestor(&l, &remote) => ctx.set_branch(head, Some(&l), &remote)?,
+                Some(l) if git::is_ancestor(&l, &remote) => ctx.set_branch(head, Some(&l), &remote, "gt get")?,
                 Some(_) => ui::warn(&format!("{head} differs from {}; keeping local (sync to reconcile)", ctx.remote)),
             }
         }
@@ -1752,14 +1743,14 @@ pub fn review(target: Option<String>) -> Result<()> {
     };
 
     match ctx.refs.head(&name).map(str::to_string) {
-        None => ctx.set_branch(&name, None, &sha)?,
+        None => ctx.set_branch(&name, None, &sha, "gt review")?,
         Some(l) if l == sha => {}
         Some(l) if git::is_ancestor(&l, &sha) => {
-            ctx.set_branch(&name, Some(&l), &sha)?;
+            ctx.set_branch(&name, Some(&l), &sha, "gt review")?;
             ui::ok(&format!("updated {} {} → {}", ui::bold(&name), ui::dim(ui::short(&l)), ui::short(&sha)));
         }
         Some(l) => {
-            ctx.set_branch(&name, Some(&l), &sha)?;
+            ctx.set_branch(&name, Some(&l), &sha, "gt review")?;
             ui::ok(&format!(
                 "reset {} to the PR head {} (was {})",
                 ui::bold(&name),
@@ -1818,4 +1809,155 @@ fn open_url(url: &str) -> Result<()> {
     std::process::Command::new(opener).arg(url).status()?;
     println!("{url}");
     Ok(())
+}
+
+// ───────────────────────────── history ─────────────────────────────
+
+/// The branch `gt history` works on (default: the current one), and where it sits.
+fn history_target(ctx: &Ctx, target: Option<String>) -> Result<(String, history::Placement)> {
+    let branch = match target {
+        Some(t) => resolve_branch(ctx, &t)?,
+        None => ctx.current()?.to_string(),
+    };
+    let placement = match ctx.store.file.find(&branch) {
+        Some(si) => {
+            let stack = &ctx.store.file.stacks[si];
+            let idx = stack.index_of(&branch).unwrap();
+            history::Placement {
+                parent: stack.parent_of(idx).to_string(),
+                below: below_heads(ctx, stack, idx),
+                lower: stack.branches[..idx].iter().map(|b| b.branch.clone()).collect(),
+            }
+        }
+        None => {
+            let trunk = ctx.default_trunk();
+            history::Placement {
+                below: [ctx.refs.remote.get(&trunk), ctx.refs.heads.get(&trunk).map(|c| &c.sha)]
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+                    .collect(),
+                parent: trunk,
+                lower: vec![],
+            }
+        }
+    };
+    Ok((branch, placement))
+}
+
+pub fn history_list(target: Option<String>, json: bool) -> Result<()> {
+    let ctx = Ctx::new(false)?;
+    let (branch, at) = history_target(&ctx, target)?;
+    let mut h = history::load(&ctx.info.common_dir, &ctx.remote, &branch, &at, true)?;
+    if json {
+        h.versions.reverse();
+        println!("{}", serde_json::to_string_pretty(&h)?);
+        return Ok(());
+    }
+    history::render(&h);
+    Ok(())
+}
+
+/// With neither side given, the version before the current one against the current one.
+pub fn history_compare(from: Option<String>, to: Option<String>, target: Option<String>, json: bool) -> Result<()> {
+    let ctx = Ctx::new(false)?;
+    let (branch, at) = history_target(&ctx, target)?;
+    let mut h = history::load(&ctx.info.common_dir, &ctx.remote, &branch, &at, false)?;
+    let (from, to) = match (from, to) {
+        (Some(f), Some(t)) => (f, t),
+        (None, None) => {
+            let cur = h.current().or(h.versions.last()).unwrap();
+            let Some(prev) = h.versions.iter().find(|v| v.version + 1 == cur.version) else {
+                bail!("{} is {branch}'s first version; name two versions to compare others", cur.label());
+            };
+            (prev.label(), cur.label())
+        }
+        _ => bail!("compare takes two versions, or none to compare the current one with the one before"),
+    };
+    let (a, b, left, right) = h.compare(&from, &to)?;
+    if json {
+        let point = |p: &history::Point| serde_json::json!({ "label": p.label, "sha": p.sha });
+        let v = serde_json::json!({
+            "branch": branch,
+            "parent": h.parent,
+            "a": point(&a),
+            "b": point(&b),
+            "left_tree": git::tree_of(&left)?,
+            "right_tree": git::tree_of(&right)?,
+            "files": history::changed_files(&left, &right)?,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    println!("{}  {}", ui::bold(&branch), ui::dim(&format!("on {}", h.parent)));
+    println!(
+        "{} ({}) → {} ({})\n",
+        ui::cyan(&a.label),
+        ui::yellow(ui::short(&a.sha)),
+        ui::cyan(&b.label),
+        ui::yellow(ui::short(&b.sha))
+    );
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    // git's own diff, with the user's pager, colors and diff settings.
+    git::run_interactive(None, &["diff", &left, &right])?;
+    Ok(())
+}
+
+pub fn history_revert(
+    version: String,
+    target: Option<String>,
+    exact: bool,
+    yes: bool,
+    paths: Vec<String>,
+) -> Result<()> {
+    let mut ctx = Ctx::new(true)?;
+    let (branch, at) = history_target(&ctx, target)?;
+    let mut h = history::load(&ctx.info.common_dir, &ctx.remote, &branch, &at, false)?;
+    let point = h.resolve(&version)?;
+    if point.sha == h.tip {
+        bail!("{} is already {branch}'s tip; nothing to revert", point.label);
+    }
+    let own = git::own_commits(&h.tip, &at.below)?;
+    if own.len() != 1 {
+        bail!("{branch} has {} commits of its own; gt needs exactly one (see `gt squash`)", own.len());
+    }
+    let paths = history::repo_relative(&paths, &ctx.info.toplevel)?;
+    let (new, mode) = h.plan_revert(&point, &paths, exact)?;
+
+    let scope = match paths.len() {
+        0 => branch.clone(),
+        1 => format!("{} on {branch}", paths[0]),
+        n => format!("{n} paths on {branch}"),
+    };
+    ui::info(&format!("reverting {} to {} ({})", ui::bold(&scope), ui::cyan(&point.label), ui::short(&point.sha)));
+    eprintln!("  {}", ui::dim(&mode));
+    for line in git::run(&["diff", "--numstat", &h.tip, &new])?.lines() {
+        let mut f = line.splitn(3, '\t');
+        let (add, del, path) = (f.next().unwrap_or(""), f.next().unwrap_or(""), f.next().unwrap_or(""));
+        eprintln!("    {} {path} {}", ui::dim("±"), ui::dim(&format!("+{add} −{del}")));
+    }
+    if !yes && !picker::confirm("Revert?")? {
+        bail!("cancelled");
+    }
+
+    let reason = format!("gt history: revert to {}", point.label);
+    ctx.set_branch(&branch, Some(&h.tip), &new, &reason)?;
+    ui::ok(&format!("{} {} → {}", ui::bold(&branch), ui::dim(ui::short(&h.tip)), ui::short(&new)));
+    let undo = h.versions.iter().find(|v| v.current).map(|v| v.label()).unwrap_or_else(|| ui::short(&h.tip).into());
+
+    let mut clean = true;
+    match ctx.store.file.find(&branch) {
+        Some(_) if exact && paths.is_empty() => {
+            ui::warn("--exact kept the old base; `gt restack` moves it (and anything above it) onto its parent")
+        }
+        Some(si) => {
+            ctx.reload()?;
+            clean = restack::run(&mut ctx, si, false)?;
+            ctx.save()?;
+        }
+        None => {}
+    }
+    eprintln!("{}", ui::dim(&format!("Undo with `gt history revert {undo}`. Not pushed: `gt submit` updates the PR.")));
+    exit_on_conflict(clean)
 }

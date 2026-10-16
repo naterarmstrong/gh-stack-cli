@@ -175,7 +175,7 @@ pub fn squash(ctx: &Ctx, si: usize) -> Result<Vec<Update>> {
 /// points at commits whose parents weren't applied.
 pub fn apply(ctx: &mut Ctx, updates: &[Update]) -> Result<()> {
     for u in updates {
-        ctx.set_branch(&u.branch, Some(&u.old), &u.new)?;
+        ctx.set_branch(&u.branch, Some(&u.old), &u.new, "gt restack")?;
         ui::ok(&format!("restacked {} {} → {}", ui::bold(&u.branch), ui::dim(ui::short(&u.old)), ui::short(&u.new)));
     }
     ctx.reload()?;

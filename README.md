@@ -52,6 +52,19 @@ Aliases are in parentheses.
 | `gt loc [target]` | Lines changed by a branch's commit, per file, split into **src / test / doc / gen**. `--json` gives machine-readable output. |
 | `gt open [target]` (`pr`) | Open a branch's PR in the browser. |
 
+### History of a branch's commit
+
+| Command | What it does |
+| --- | --- |
+| `gt history [branch]` (`h`) | Every version of a branch's commit, newest first: p1, p2, … with when and how each appeared, whether it reached the remote, and what it changed over the version before. `--json` gives machine-readable output. |
+| `gt history show <n>` | What version `n` changed over its own base, as a diff. This is the PR as it was at that version. |
+| `gt history compare [a b]` | What changed from version `a` to version `b`. With no versions it compares the previous version with the current one. `base` stands for the other side's parent. `--json` gives the endpoints, the two trees and the changed files. |
+| `gt history revert <n> [-- paths…]` | Put the branch, or only the given paths, back on version `n`, then restack like `gt modify`. `--exact` takes the version as it was (its old base, or its files verbatim) for when re-applying it conflicts. `-y` skips the confirmation. |
+
+These commands take a branch with `-b`. Versions are named `p3` or `3`, and any commit works too.
+
+Since `gt modify` amends the branch's one commit, the branch's reflog holds every version of it. A move that keeps the patch, such as a restack or a revert back to an earlier version, folds into that version (by `git patch-id`) instead of adding a new one. What a version changed is an interdiff: the earlier patch is re-applied onto the later one's base before diffing, so whatever landed on the parent in between is left out. Reflogs are per-clone, so the history only covers this clone, and "pushed"/"fetched" only cover pushes and fetches made from it. Patch-ids and re-applied trees are cached under `<git-common-dir>/gt/history-v<N>.json`, where an entry is dropped once it goes 30 days without being read, and diff sizes share `gt loc`'s cache, so a warm run reads the reflogs and spawns a single `git rev-list`.
+
 ### Moving around
 
 | Command | What it does |
@@ -137,5 +150,6 @@ cargo fmt      # max_width = 120, see rustfmt.toml
 | `src/git.rs` | Git plumbing (gix plus the `git` binary) |
 | `src/github.rs` | GraphQL client |
 | `src/loc.rs` | Diff line counting and classification |
+| `src/history.rs` | Version history from the reflog, interdiffs and revert planning |
 | `src/picker.rs` | Interactive picker |
 | `src/ui.rs` | Terminal colors and messages |
