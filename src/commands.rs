@@ -743,14 +743,23 @@ fn exit_on_conflict(clean: bool) -> Result<()> {
 
 pub fn modify(all: bool, message: Option<String>) -> Result<()> {
     let mut ctx = Ctx::new(true)?;
-    let si = ctx.current_stack()?;
     let cur = ctx.current()?.to_string();
-    let stack = &ctx.store.file.stacks[si];
-    let idx = stack.index_of(&cur).unwrap();
-    let parent = stack.parent_of(idx).to_string();
-    let head = ctx.refs.head(&cur).unwrap_or_default();
+    let si = ctx.store.file.find(&cur);
     // A branch sitting exactly on its parent has no commit yet: make one instead of amending.
-    let empty = ctx.refs.head(&parent) == Some(head) || ctx.refs.remote.get(&parent).map(String::as_str) == Some(head);
+    let empty = match si {
+        Some(si) => {
+            let stack = &ctx.store.file.stacks[si];
+            let parent = stack.parent_of(stack.index_of(&cur).unwrap()).to_string();
+            let head = ctx.refs.head(&cur).unwrap_or_default();
+            ctx.refs.head(&parent) == Some(head) || ctx.refs.remote.get(&parent).map(String::as_str) == Some(head)
+        }
+        // Outside a stack there's no parent to compare with, so go by trunk: a branch
+        // with nothing of its own on top of it has no commit yet.
+        None => {
+            let trunk = ctx.default_trunk();
+            [ctx.remote_ref(&trunk), trunk].iter().any(|t| git::rev_parse(t).is_some() && git::is_ancestor("HEAD", t))
+        }
+    };
 
     if all {
         git::run(&["add", "-A"])?;
@@ -765,10 +774,12 @@ pub fn modify(all: bool, message: Option<String>) -> Result<()> {
         None => {}
     }
     if !empty && message.is_none() && !git::has_staged_changes()? {
-        ui::info("nothing staged; just restacking");
+        ui::info(if si.is_some() { "nothing staged; just restacking" } else { "nothing staged" });
     } else if !git::run_interactive(None, &args)? {
         bail!("git commit failed");
     }
+    // Not stacked: nothing above it to restack.
+    let Some(si) = si else { return Ok(()) };
     ctx.reload()?;
     let clean = restack::run(&mut ctx, si, false)?;
     ctx.save()?;
