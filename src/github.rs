@@ -107,6 +107,7 @@ pub struct ReviewPr {
     pub state: String,
     pub is_draft: bool,
     pub head_ref_name: String,
+    pub base_ref_name: String,
     pub is_cross_repository: bool,
     pub additions: u64,
     pub deletions: u64,
@@ -114,7 +115,7 @@ pub struct ReviewPr {
 }
 
 const REVIEW_FIELDS: &str =
-    "number title state isDraft headRefName isCrossRepository additions deletions author { login }";
+    "number title state isDraft headRefName baseRefName isCrossRepository additions deletions author { login }";
 
 pub enum PrQuery {
     Number(u64),

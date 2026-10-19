@@ -115,9 +115,11 @@ To fix a branch that sync skipped, run `gt checkout <branch> && gt restack --tru
 ### Reviewing others' PRs
 
 ```sh
-gt review            # pick from PRs where you're a requested reviewer (directly, not via a team)
+gt review            # pick from PRs where you're a requested reviewer (directly, not via a team), stacks grouped first
 gt review 1234       # or by PR number, URL or branch name
 ```
+
+The picker lists stacked PRs first, each stack top-down above its base branch, then the other PRs. A PR counts as stacked when its base is another listed PR's branch or anything but trunk.
 
 `gt review` (`rv`) checks out a PR read-only and marks it with `branch.<name>.gtReview` in git config. Review branches appear below your stacks in `gt log` and `gt ls`. `gt sync` moves them to the PR head, even after a force push, and drops any local commits on them. It never restacks or pushes them.
 

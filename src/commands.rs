@@ -1,6 +1,6 @@
 use crate::ctx::{Ctx, Review};
 use crate::git;
-use crate::github::{MutationBatch, Pr, PrQuery};
+use crate::github::{MutationBatch, Pr, PrQuery, ReviewPr};
 use crate::history;
 use crate::loc;
 use crate::picker;
@@ -8,7 +8,7 @@ use crate::restack;
 use crate::state::{BranchRef, PrRef, Stack};
 use crate::ui;
 use anyhow::{Result, anyhow, bail};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ───────────────────────────── log ─────────────────────────────
 
@@ -1655,6 +1655,90 @@ fn review_key(branch: &str) -> String {
     format!("branch.{branch}.gtReview")
 }
 
+/// Splits review requests into stacks and standalone PRs, keeping the search's
+/// newest-first order. A PR is stacked when its base is another listed PR's head,
+/// or anything but trunk. Each stack is a list of chains, each top first.
+fn review_groups<'a>(prs: &'a [ReviewPr], trunk: &str) -> (Vec<Vec<&'a ReviewPr>>, Vec<&'a ReviewPr>) {
+    let parent = |p: &ReviewPr| prs.iter().position(|q| q.number != p.number && q.head_ref_name == p.base_ref_name);
+    let root = |mut i: usize| {
+        let mut seen = HashSet::new();
+        while let Some(j) = parent(&prs[i]).filter(|_| seen.insert(i)) {
+            i = j;
+        }
+        i
+    };
+    let mut stacks: Vec<(usize, Vec<&ReviewPr>)> = vec![];
+    let mut alone = vec![];
+    for (i, p) in prs.iter().enumerate() {
+        let r = root(i);
+        let has_child = prs.iter().any(|q| parent(q) == Some(i));
+        if r == i && !has_child && p.base_ref_name == trunk {
+            alone.push(p);
+        } else if !stacks.iter().any(|(sr, _)| *sr == r) {
+            stacks.push((r, vec![]));
+        }
+    }
+    for (r, members) in &mut stacks {
+        // Depth-first from the root, then reversed so the top of the stack comes first.
+        let mut todo = vec![*r];
+        let mut seen = HashSet::new();
+        while let Some(i) = todo.pop() {
+            if !seen.insert(i) {
+                continue;
+            }
+            members.push(&prs[i]);
+            todo.extend((0..prs.len()).rev().filter(|&j| parent(&prs[j]) == Some(i)));
+        }
+        members.reverse();
+    }
+    (stacks.into_iter().map(|(_, m)| m).collect(), alone)
+}
+
+/// Picker rows for `gt review`: each stack above its base branch, then the other PRs.
+fn review_items(prs: &[ReviewPr], trunk: &str) -> Vec<picker::Item> {
+    let num_w = prs.iter().map(|p| p.number.to_string().len()).max().unwrap_or(0) + 1;
+    let line = |p: &ReviewPr, marker: &str| {
+        let title: String = p.title.chars().take(70).collect();
+        let mut badges = vec![
+            ui::green(&format!("+{}", loc::human(p.additions as u32))),
+            ui::red(&format!("−{}", loc::human(p.deletions as u32))),
+        ];
+        if let Some(a) = &p.author {
+            badges.push(ui::blue(&format!("by {}", a.login)));
+        }
+        if p.is_draft {
+            badges.push(ui::dim("draft"));
+        }
+        picker::Item {
+            text: format!("{marker}{:num_w$}  {title}  {}", format!("#{}", p.number), badges.join(" ")),
+            // Filtering matches on the key, so include the title and branch.
+            key: Some(format!("{}\t{} {}", p.number, p.title, p.head_ref_name)),
+        }
+    };
+    let decor = |text: String| picker::Item { text, key: None };
+    let (stacks, alone) = review_groups(prs, trunk);
+    let mut items = vec![];
+    if !stacks.is_empty() {
+        items.push(decor(ui::dim("Stacks")));
+    }
+    for (n, stack) in stacks.iter().enumerate() {
+        if n > 0 {
+            items.push(decor(String::new()));
+        }
+        items.extend(stack.iter().map(|p| line(p, "◯ ")));
+        let base = &stack.last().unwrap().base_ref_name;
+        items.push(decor(ui::dim(&format!("└ {base}"))));
+    }
+    if !alone.is_empty() {
+        if !stacks.is_empty() {
+            items.push(decor(String::new()));
+            items.push(decor(ui::dim("Other PRs")));
+        }
+        items.extend(alone.into_iter().map(|p| line(p, "")));
+    }
+    items
+}
+
 pub fn review(target: Option<String>) -> Result<()> {
     let mut ctx = Ctx::new(false)?;
     let (pr, head) = match target {
@@ -1664,28 +1748,7 @@ pub fn review(target: Option<String>) -> Result<()> {
                 println!("No open PRs are waiting on your review.");
                 return Ok(());
             }
-            let num_w = prs.iter().map(|p| p.number.to_string().len()).max().unwrap_or(0) + 1;
-            let items: Vec<picker::Item> = prs
-                .iter()
-                .map(|p| {
-                    let title: String = p.title.chars().take(70).collect();
-                    let mut badges = vec![
-                        ui::green(&format!("+{}", loc::human(p.additions as u32))),
-                        ui::red(&format!("−{}", loc::human(p.deletions as u32))),
-                    ];
-                    if let Some(a) = &p.author {
-                        badges.push(ui::blue(&format!("by {}", a.login)));
-                    }
-                    if p.is_draft {
-                        badges.push(ui::dim("draft"));
-                    }
-                    picker::Item {
-                        text: format!("{:num_w$}  {title}  {}", format!("#{}", p.number), badges.join(" ")),
-                        // Filtering matches on the key, so include the title and branch.
-                        key: Some(format!("{}\t{} {}", p.number, p.title, p.head_ref_name)),
-                    }
-                })
-                .collect();
+            let items = review_items(&prs, &ctx.default_trunk());
             let picked = picker::pick("Review", &items, None)?.ok_or_else(|| anyhow!("cancelled"))?;
             let n: u64 = picked.split('\t').next().unwrap().parse()?;
             let pr = prs.into_iter().find(|p| p.number == n).unwrap();
@@ -1960,4 +2023,40 @@ pub fn history_revert(
     }
     eprintln!("{}", ui::dim(&format!("Undo with `gt history revert {undo}`. Not pushed: `gt submit` updates the PR.")));
     exit_on_conflict(clean)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pr(number: u64, head: &str, base: &str) -> ReviewPr {
+        ReviewPr {
+            number,
+            title: format!("PR {number}"),
+            state: "OPEN".into(),
+            is_draft: false,
+            head_ref_name: head.into(),
+            base_ref_name: base.into(),
+            is_cross_repository: false,
+            additions: 0,
+            deletions: 0,
+            author: None,
+        }
+    }
+
+    #[test]
+    fn review_groups_split_stacks_from_other_prs() {
+        let prs = vec![
+            pr(5, "b", "a"),
+            pr(1, "solo", "main"),
+            pr(4, "a", "main"),
+            pr(7, "x", "other-feature"),
+            pr(6, "c", "b"),
+            pr(2, "solo2", "main"),
+        ];
+        let (stacks, alone) = review_groups(&prs, "main");
+        let nums = |v: &[&ReviewPr]| v.iter().map(|p| p.number).collect::<Vec<_>>();
+        assert_eq!(stacks.iter().map(|s| nums(s)).collect::<Vec<_>>(), vec![vec![6, 5, 4], vec![7]]);
+        assert_eq!(nums(&alone), vec![1, 2]);
+    }
 }
