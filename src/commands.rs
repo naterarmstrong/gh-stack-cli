@@ -358,8 +358,7 @@ fn render_reviews(ctx: &Ctx, prs: &HashMap<String, Pr>, detail: bool) {
         .iter()
         .find_map(|u| crate::github::parse_remote(u))
         .map(|(host, owner, repo)| format!("https://{host}/{owner}/{repo}"));
-    println!("\n{}", ui::dim("Reviewing"));
-    for r in &ctx.reviews {
+    let line = |r: &Review| {
         let here = cur == Some(r.branch.as_str());
         let marker = if here { ui::cyan("◉") } else { "◯".to_string() };
         let name = format!("{:width$}", r.branch);
@@ -389,8 +388,73 @@ fn render_reviews(ctx: &Ctx, prs: &HashMap<String, Pr>, detail: bool) {
                 line += &format!("  {}", ui::dim(&c.subject));
             }
         }
-        println!("{}", line.trim_end());
+        line.trim_end().to_string()
+    };
+    let base = |r: &Review| r.base.clone().or_else(|| Some(prs.get(&r.branch)?.base_ref_name.clone()));
+    let (stacks, alone) = review_stacks(&ctx.reviews, base, &ctx.default_trunk());
+    println!("\n{}", ui::dim("Reviewing"));
+    for (n, (members, below)) in stacks.iter().enumerate() {
+        if n > 0 {
+            println!();
+        }
+        for r in members {
+            println!("{}", line(r));
+        }
+        let here = cur == Some(below.as_str());
+        let name = if here { ui::bold(&ui::cyan(below)) } else { ui::dim(below) };
+        println!("{}  {name}", if here { ui::cyan("◉") } else { ui::dim("◯") });
     }
+    if !alone.is_empty() {
+        if !stacks.is_empty() {
+            println!();
+        }
+        for r in alone {
+            println!("{}", line(r));
+        }
+    }
+}
+
+/// Splits review branches into stacks and standalone branches. A review branch
+/// is stacked when its base is another review branch, or anything but trunk.
+/// Each stack is listed top first, followed by the branch it sits on.
+fn review_stacks<'a>(
+    reviews: &'a [Review],
+    base: impl Fn(&Review) -> Option<String>,
+    trunk: &str,
+) -> (Vec<(Vec<&'a Review>, String)>, Vec<&'a Review>) {
+    let bases: Vec<Option<String>> = reviews.iter().map(&base).collect();
+    let parent =
+        |i: usize| reviews.iter().position(|r| Some(&r.branch) == bases[i].as_ref() && r.branch != reviews[i].branch);
+    let mut stacks = vec![];
+    let mut alone = vec![];
+    for i in 0..reviews.len() {
+        if parent(i).is_some() {
+            continue;
+        }
+        let has_child = (0..reviews.len()).any(|j| parent(j) == Some(i));
+        let below = bases[i].clone();
+        if !has_child && below.as_deref().is_none_or(|b| b == trunk) {
+            alone.push(&reviews[i]);
+            continue;
+        }
+        // Depth-first from the bottom, then reversed so the top comes first.
+        let mut members = vec![];
+        let mut todo = vec![i];
+        let mut seen = HashSet::new();
+        while let Some(k) = todo.pop() {
+            if seen.insert(k) {
+                members.push(&reviews[k]);
+                todo.extend((0..reviews.len()).rev().filter(|&j| parent(j) == Some(k)));
+            }
+        }
+        members.reverse();
+        stacks.push((members, below.unwrap_or_else(|| trunk.to_string())));
+    }
+    // Bases that loop have no bottom to start from; list those branches on their own.
+    let placed: HashSet<&str> =
+        stacks.iter().flat_map(|(m, _)| m.iter()).chain(&alone).map(|r| r.branch.as_str()).collect();
+    alone.extend(reviews.iter().filter(|r| !placed.contains(r.branch.as_str())));
+    (stacks, alone)
 }
 
 /// The diff of a stacked branch's own commit, or nothing for merged or
@@ -552,6 +616,13 @@ pub fn log(stack_only: bool, offline: bool) -> Result<()> {
             }
         }
     };
+    // Keep each review branch's recorded base current, so `gt ls` can still
+    // group them into stacks offline (and after a PR is retargeted).
+    for r in &ctx.reviews {
+        if let Some(p) = prs.get(&r.branch).filter(|p| r.base.as_deref() != Some(p.base_ref_name.as_str())) {
+            let _ = git::run(&["config", &review_base_key(&r.branch), &p.base_ref_name]);
+        }
+    }
     render_stacks(&ctx, &sis, &prs, !offline);
     if show_reviews {
         render_reviews(&ctx, &prs, !offline);
@@ -1109,11 +1180,9 @@ fn adopt_remote(ctx: &Ctx, branch: &str, parent_ref: &str) -> Result<()> {
 
 pub struct SyncOpts {
     pub all: bool,
-    pub no_push: bool,
     pub no_prune: bool,
     pub prefer_remote: bool,
     pub offline: bool,
-    pub no_verify: bool,
 }
 
 /// Stores PR numbers/ids from GitHub in the stack state and marks merged ones.
@@ -1145,6 +1214,10 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         fetch_reviews(&ctx);
         ctx.reload()?;
         update_reviews(&ctx);
+        ctx.reload()?;
+        if !opts.no_prune && !opts.offline {
+            prune_reviews(&mut ctx)?;
+        }
         return Ok(());
     }
 
@@ -1190,6 +1263,9 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
     ctx.reload()?;
     update_reviews(&ctx);
     ctx.reload()?;
+    if !opts.no_prune && !opts.offline {
+        prune_reviews(&mut ctx)?;
+    }
 
     // 3. Delete local branches whose PRs merged, as long as the local head is
     // exactly what was merged. Done before restacking so a stack that can't be
@@ -1267,22 +1343,15 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
                 restacked.push(si);
                 skipped.extend(s);
             }
-            Err(e) => ui::warn(&format!(
-                "not restacking or pushing the stack on {}: {e:#}",
-                ctx.store.file.stacks[si].trunk.branch
-            )),
+            Err(e) => {
+                ui::warn(&format!("not restacking the stack on {}: {e:#}", ctx.store.file.stacks[si].trunk.branch))
+            }
         }
     }
 
-    // 7. Push branches that already have a remote copy.
-    if !opts.no_push {
-        for &si in &restacked {
-            let branches: Vec<String> =
-                needs_push(&ctx, si).into_iter().filter(|b| ctx.refs.remote.contains_key(b)).collect();
-            push(&ctx, &branches, opts.no_verify)?;
-        }
-        ctx.reload()?;
-    }
+    // Sync never pushes; `gt submit` does, once you've looked at the result.
+    let unpushed: Vec<String> =
+        restacked.iter().flat_map(|&si| needs_push(&ctx, si)).filter(|b| ctx.refs.remote.contains_key(b)).collect();
 
     restack::record_heads(&mut ctx);
     ctx.save()?;
@@ -1298,7 +1367,46 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
             skipped.iter().map(|b| ui::bold(b)).collect::<Vec<_>>().join(", ")
         );
     }
+    if !unpushed.is_empty() {
+        eprintln!(
+            "\n{} changed locally and aren't pushed; `gt submit` pushes them.",
+            unpushed.iter().map(|b| ui::bold(b)).collect::<Vec<_>>().join(", ")
+        );
+    }
     Ok(())
+}
+
+/// Deletes review branches whose PR merged. They're read-only copies, so
+/// nothing local is lost, but one checked out in another worktree is kept.
+fn prune_reviews(ctx: &mut Ctx) -> Result<()> {
+    let queries: Vec<(String, PrQuery)> =
+        ctx.reviews.iter().filter_map(|r| Some((r.branch.clone(), PrQuery::Number(r.pr?)))).collect();
+    let prs = match query_prs(ctx, queries, false) {
+        Ok((_, m)) => m,
+        Err(e) => {
+            ui::warn(&format!("couldn't check review PRs for merges: {e:#}"));
+            return Ok(());
+        }
+    };
+    let trunk = ctx.default_trunk();
+    for r in ctx.reviews.clone() {
+        let Some(pr) = prs.get(&r.branch).filter(|p| p.state == "MERGED") else { continue };
+        if let Some(wt) = ctx.other_worktree(&r.branch) {
+            ui::info(&format!("{} merged; not deleting it, it's checked out in {}", r.branch, wt.display()));
+            continue;
+        }
+        if ctx.info.current_branch.as_deref() == Some(r.branch.as_str()) && !leave_branch(ctx, &r.branch, None, &trunk)?
+        {
+            continue;
+        }
+        // Also drops its branch.<b> config: the review marks and the PR link.
+        git::run(&["branch", "--quiet", "-D", &r.branch])?;
+        if r.fork_pr().is_some() {
+            let _ = git::run(&["update-ref", "-d", &ctx.review_ref(&r)]);
+        }
+        ui::ok(&format!("deleted review branch {} (#{} merged)", ui::bold(&r.branch), pr.number));
+    }
+    ctx.reload()
 }
 
 fn prune(ctx: &mut Ctx, sis: &[usize], prs: &HashMap<String, Pr>) -> Result<()> {
@@ -1666,6 +1774,10 @@ fn review_key(branch: &str) -> String {
     format!("branch.{branch}.gtReview")
 }
 
+fn review_base_key(branch: &str) -> String {
+    format!("branch.{branch}.gtReviewBase")
+}
+
 /// Splits review requests into stacks and standalone PRs, keeping the search's
 /// newest-first order. A PR is stacked when its base is another listed PR's head,
 /// or anything but trunk. Each stack is a list of chains, each top first.
@@ -1783,15 +1895,6 @@ pub fn review(target: Option<String>) -> Result<()> {
         }
     };
 
-    // Branches from forks don't exist on our remote; name them after the PR.
-    let cross = pr.as_ref().is_some_and(|p| p.is_cross_repository);
-    let name = match &pr {
-        Some(p) if cross => format!("pr/{}", p.number),
-        _ => head.clone(),
-    };
-    if ctx.store.file.find(&name).is_some() {
-        bail!("{name} is one of your stacked branches; use `gt co {name}`");
-    }
     if let Some(p) = &pr {
         let author = p.author.as_ref().map(|a| format!(" by {}", a.login)).unwrap_or_default();
         ui::info(&format!("#{} {}{author}", p.number, ui::bold(&p.title)));
@@ -1799,11 +1902,86 @@ pub fn review(target: Option<String>) -> Result<()> {
             ui::warn(&format!("#{} is {}", p.number, p.state.to_lowercase()));
         }
     }
+    let name = pull_review(&mut ctx, pr.as_ref(), &head)?;
+    if let Some(p) = &pr {
+        review_stack(&mut ctx, p)?;
+    }
+    if let Some(wt) = ctx.other_worktree(&name) {
+        ui::info(&format!("{name} is checked out in {}", wt.display()));
+        return Ok(());
+    }
+    checkout(&ctx, &name)
+}
 
+/// Pulls down the rest of a stacked PR's stack so it can be reviewed whole:
+/// the PRs it sits on, nearest parent first, then every PR stacked above it.
+/// Each walk stops at trunk or at a PR `stack_skip` rejects, so a draft cuts
+/// off whatever is beyond it.
+fn review_stack(ctx: &mut Ctx, pr: &ReviewPr) -> Result<()> {
+    let trunk = ctx.default_trunk();
+    let mut seen = HashSet::from([pr.head_ref_name.clone()]);
+    let mut base = pr.base_ref_name.clone();
+    while base != trunk && seen.insert(base.clone()) {
+        let Some(p) = ctx.gh()?.review_pr(&PrQuery::Head(base.clone()))? else {
+            break;
+        };
+        if !pull_stacked(ctx, &p)? {
+            break;
+        }
+        base = p.base_ref_name.clone();
+    }
+    let mut todo = vec![pr.head_ref_name.clone()];
+    while let Some(head) = todo.pop() {
+        for p in ctx.gh()?.review_prs_on(&head)? {
+            if seen.insert(p.head_ref_name.clone()) && pull_stacked(ctx, &p)? {
+                todo.push(p.head_ref_name.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pulls down one PR from the reviewed PR's stack, or says why it won't.
+/// Returns whether it did, i.e. whether to keep walking past it.
+fn pull_stacked(ctx: &mut Ctx, p: &ReviewPr) -> Result<bool> {
+    let why = if p.state != "OPEN" {
+        Some(format!("is {}", p.state.to_lowercase()))
+    } else if p.is_draft {
+        Some("is a draft".to_string())
+    } else if p.is_cross_repository {
+        Some("is from a fork".to_string())
+    } else if ctx.store.file.find(&p.head_ref_name).is_some() {
+        Some("is one of your stacked branches".to_string())
+    } else if ctx.refs.head(&p.head_ref_name).is_some() && !ctx.reviews.iter().any(|r| r.branch == p.head_ref_name) {
+        Some("is a local branch you didn't pull down with gt review".to_string())
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        ui::info(&format!("stopped at #{} {}: it {why}", p.number, ui::bold(&p.head_ref_name)));
+        return Ok(false);
+    }
+    ui::info(&format!("also pulling down #{} {}", p.number, ui::bold(&p.title)));
+    pull_review(ctx, Some(p), &p.head_ref_name)?;
+    Ok(true)
+}
+
+/// Fetches a PR's head into a local branch, marks it as a review branch and
+/// ties it to its PR. Returns the local branch name.
+fn pull_review(ctx: &mut Ctx, pr: Option<&ReviewPr>, head: &str) -> Result<String> {
+    // Branches from forks don't exist on our remote; name them after the PR.
+    let cross = pr.is_some_and(|p| p.is_cross_repository);
+    let name = match &pr {
+        Some(p) if cross => format!("pr/{}", p.number),
+        _ => head.to_string(),
+    };
+    if ctx.store.file.find(&name).is_some() {
+        bail!("{name} is one of your stacked branches; use `gt co {name}`");
+    }
     let sha = if cross {
-        let n = pr.as_ref().unwrap().number;
+        let n = pr.unwrap().number;
         // Kept in a ref so `gt ls` can tell when the PR moves on.
-        let dest = ctx.review_ref(&Review { branch: name.clone(), pr: Some(n) });
+        let dest = ctx.review_ref(&Review { branch: name.clone(), pr: Some(n), base: None });
         let refspec = format!("+refs/pull/{n}/head:{dest}");
         let out = git::run_raw(None, &["fetch", "--quiet", "--no-tags", &ctx.remote, &refspec], None, &[])?;
         if !out.ok {
@@ -1811,9 +1989,9 @@ pub fn review(target: Option<String>) -> Result<()> {
         }
         git::rev_parse(&dest).ok_or_else(|| anyhow!("fetched refs/pull/{n}/head but {dest} is missing"))?
     } else {
-        fetch(&ctx, &[head.clone()])?;
+        fetch(ctx, &[head.to_string()])?;
         ctx.reload()?;
-        ctx.refs.remote.get(&head).cloned().ok_or_else(|| anyhow!("{head} isn't on {}", ctx.remote))?
+        ctx.refs.remote.get(head).cloned().ok_or_else(|| anyhow!("{head} isn't on {}", ctx.remote))?
     };
 
     match ctx.refs.head(&name).map(str::to_string) {
@@ -1833,24 +2011,21 @@ pub fn review(target: Option<String>) -> Result<()> {
             ));
         }
     }
-    let marker = pr.as_ref().map(|p| p.number.to_string()).unwrap_or_else(|| "true".into());
+    let marker = pr.map(|p| p.number.to_string()).unwrap_or_else(|| "true".into());
     git::run(&["config", &review_key(&name), &marker])?;
-    if let Some(p) = &pr {
+    if let Some(p) = pr {
         // What the GitHub Pull Requests extension (and its checkout) uses to tie
         // a branch to its PR; fork branches have no upstream to match on.
         let gh = ctx.gh()?;
         let link = format!("{}#{}#{}", gh.owner, gh.repo, p.number);
         git::run(&["config", &format!("branch.{name}.github-pr-owner-number"), &link])?;
+        git::run(&["config", &review_base_key(&name), &p.base_ref_name])?;
     }
     ctx.reload()?;
     if !cross {
         ctx.ensure_upstreams([name.as_str()]);
     }
-    if let Some(wt) = ctx.other_worktree(&name) {
-        ui::info(&format!("{name} is checked out in {}", wt.display()));
-        return Ok(());
-    }
-    checkout(&ctx, &name)
+    Ok(name)
 }
 
 pub fn open(target: Option<String>) -> Result<()> {
@@ -2053,6 +2228,39 @@ mod tests {
             deletions: 0,
             author: None,
         }
+    }
+
+    fn rv(branch: &str, base: &str) -> Review {
+        Review { branch: branch.into(), pr: None, base: Some(base.into()) }
+    }
+
+    fn names(rs: &[&Review]) -> Vec<String> {
+        rs.iter().map(|r| r.branch.clone()).collect()
+    }
+
+    #[test]
+    fn review_stacks_group_branches_by_base() {
+        let reviews = [rv("a1", "main"), rv("b", "main"), rv("a3", "a2"), rv("a2", "a1"), rv("c2", "c1"), rv("x", "y")];
+        let (stacks, alone) = review_stacks(&reviews, |r| r.base.clone(), "main");
+        let got: Vec<(Vec<String>, String)> = stacks.iter().map(|(m, b)| (names(m), b.clone())).collect();
+        assert_eq!(
+            got,
+            vec![
+                (vec!["a3".into(), "a2".into(), "a1".into()], "main".to_string()),
+                // Sits on a branch that wasn't pulled down (say, a draft).
+                (vec!["c2".into()], "c1".to_string()),
+                (vec!["x".into()], "y".to_string()),
+            ]
+        );
+        assert_eq!(names(&alone), vec!["b"]);
+    }
+
+    #[test]
+    fn review_stacks_keep_branches_whose_bases_loop() {
+        let reviews = [rv("p", "q"), rv("q", "p"), rv("s", "main")];
+        let (stacks, alone) = review_stacks(&reviews, |r| r.base.clone(), "main");
+        assert!(stacks.is_empty());
+        assert_eq!(names(&alone), vec!["s", "p", "q"]);
     }
 
     #[test]

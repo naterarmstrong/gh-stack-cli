@@ -251,6 +251,17 @@ impl Client {
         Ok(if v.is_null() { None } else { serde_json::from_value(v.clone()).ok() })
     }
 
+    /// Open PRs whose base is `base`, i.e. the PRs stacked directly on it.
+    pub fn review_prs_on(&self, base: &str) -> Result<Vec<ReviewPr>> {
+        let field = format!(
+            "pullRequests(baseRefName: {}, states: OPEN, first: 50) {{ nodes {{ {REVIEW_FIELDS} }} }}",
+            json!(base)
+        );
+        let data = self.graphql(&format!("query {{ {} {{ prs: {field} }} }}", self.repo_selector()))?;
+        let nodes = data["repository"]["prs"]["nodes"].as_array().cloned().unwrap_or_default();
+        Ok(nodes.into_iter().filter_map(|n| serde_json::from_value(n).ok()).collect())
+    }
+
     pub fn stack_for_pr(&self, pr: u64) -> Result<Option<RemoteStack>> {
         let v = self.rest("GET", &format!("repos/{}/{}/stacks?pull_request={pr}", self.owner, self.repo), None)?;
         let stacks: Vec<RemoteStack> = match v {

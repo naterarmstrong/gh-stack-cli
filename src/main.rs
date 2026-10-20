@@ -87,26 +87,23 @@ enum Cmd {
     /// Abort a conflicted restack: undo the `git rebase`, mark the branch as needing a
     /// rebase, and return to the branch you were on
     Abort,
-    /// Fetch, mark merged PRs, pull in remote fixes, restack onto trunk, push.
-    /// Branches that conflict are left in place and marked as needing a rebase.
-    /// Also moves review branches to their PR heads, overwriting local commits.
+    /// Fetch, mark merged PRs, pull in remote fixes, restack onto trunk. Never pushes; use
+    /// `gt submit` for that. Branches that conflict are left in place and marked as needing a
+    /// rebase. Also moves review branches to their PR heads, overwriting local commits, and
+    /// deletes review branches whose PR merged.
     #[command(visible_alias = "s")]
     Sync {
         #[arg(short, long)]
         all: bool,
-        #[arg(long)]
-        no_push: bool,
-        /// Keep local branches of merged PRs
+        /// Keep local branches of merged PRs, review branches included
         #[arg(long)]
         no_prune: bool,
         /// When a branch changed both locally and remotely, take the remote
         #[arg(long)]
         prefer_remote: bool,
-        /// Skip GitHub API calls (git fetch/push only)
+        /// Skip GitHub API calls (git fetch only)
         #[arg(long)]
         offline: bool,
-        #[arg(long)]
-        no_verify: bool,
     },
     /// Push the stack, create/retarget PRs, and link them as a GitHub stack
     #[command(visible_alias = "ss")]
@@ -148,7 +145,8 @@ enum Cmd {
         include_diverged: bool,
     },
     /// Check out a PR to review, read-only: `gt sync` moves it to the PR head (even after a
-    /// force push, dropping local commits) but never restacks or pushes it.
+    /// force push, dropping local commits) but never restacks or pushes it. A stacked PR also
+    /// pulls down the open, non-draft PRs below and above it, stopping at trunk or a draft.
     /// Without a target, pick from PRs where you're a requested reviewer (not via a team).
     #[command(visible_alias = "rv")]
     Review {
@@ -238,8 +236,8 @@ fn main() {
         Cmd::Squash => commands::squash_cmd(),
         Cmd::Continue => commands::continue_cmd(),
         Cmd::Abort => commands::abort_cmd(),
-        Cmd::Sync { all, no_push, no_prune, prefer_remote, offline, no_verify } => {
-            commands::sync(commands::SyncOpts { all, no_push, no_prune, prefer_remote, offline, no_verify })
+        Cmd::Sync { all, no_prune, prefer_remote, offline } => {
+            commands::sync(commands::SyncOpts { all, no_prune, prefer_remote, offline })
         }
         Cmd::Submit { draft, no_verify, relink } => commands::submit(draft, no_verify, relink),
         Cmd::Get { target } => commands::get(target),

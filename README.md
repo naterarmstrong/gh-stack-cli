@@ -36,7 +36,8 @@ gt modify -a                            # amend, restack everything above it
 gt submit
 
 # once PRs merge
-gt sync                                 # fetch, prune merged, restack onto trunk, push
+gt sync                                 # fetch, prune merged, restack onto trunk
+gt submit                               # push what sync restacked
 ```
 
 ## Commands
@@ -90,7 +91,7 @@ Since `gt modify` amends the branch's one commit, the branch's reflog holds ever
 | Command | What it does |
 | --- | --- |
 | `gt submit` (`ss`) | Restack, push, create PRs (title and body from the commit message) or retarget them onto the right base, and link the stack on GitHub. `--draft` opens new PRs as drafts. `--relink` replaces the GitHub stack if it doesn't match the local order. |
-| `gt sync` (`s`) | Fetch, mark merged PRs, pull in commits others pushed to your branches, fast-forward local trunks (including ones checked out in other worktrees), restack onto trunk, and push branches that already exist on the remote. A branch that would conflict is left where it is and marked **needs rebase** in `gt log`/`gt ls`; the branches above it are restacked onto it. Sync never stops for a conflict or checks out a branch. See flags below. |
+| `gt sync` (`s`) | Fetch, mark merged PRs, pull in commits others pushed to your branches, fast-forward local trunks (including ones checked out in other worktrees), and restack onto trunk. It never pushes: it lists the branches that changed and aren't pushed, and `gt submit` pushes them. A branch that would conflict is left where it is and marked **needs rebase** in `gt log`/`gt ls`; the branches above it are restacked onto it. Sync never stops for a conflict or checks out a branch. See flags below. |
 | `gt get <target>` | Pull down a stack from GitHub by PR number, URL or branch. |
 | `gt track [branches…]` | Start tracking existing branches (bottom first) as a stack. Defaults to the current branch. `--trunk` sets the trunk. |
 
@@ -99,11 +100,9 @@ To fix a branch that sync skipped, run `gt checkout <branch> && gt restack --tru
 `gt sync` flags:
 
 - `-a, --all`: sync every stack, not just the current one
-- `--no-push`: don't push
-- `--no-prune`: keep local branches of merged PRs
+- `--no-prune`: keep local branches of merged PRs, review branches included
 - `--prefer-remote`: when a branch changed both locally and on the remote, take the remote (the default keeps local and warns)
-- `--offline`: skip GitHub API calls and only run git fetch/push
-- `--no-verify`: skip pre-push hooks
+- `--offline`: skip GitHub API calls and only run git fetch (merged review branches aren't pruned)
 
 ### Cleaning up
 
@@ -121,7 +120,11 @@ gt review 1234       # or by PR number, URL or branch name
 
 The picker lists stacked PRs first, each stack top-down above its base branch, then the other PRs. A PR counts as stacked when its base is another listed PR's branch or anything but trunk.
 
-`gt review` (`rv`) checks out a PR read-only and marks it with `branch.<name>.gtReview` in git config. Review branches appear below your stacks in `gt log` and `gt ls`. `gt sync` moves them to the PR head, even after a force push, and drops any local commits on them. It never restacks or pushes them.
+`gt review` (`rv`) checks out a PR read-only and marks it with `branch.<name>.gtReview` in git config. Review branches appear below your stacks in `gt log` and `gt ls`. `gt sync` moves them to the PR head, even after a force push, and drops any local commits on them. It never restacks or pushes them, and it deletes them once their PR merges.
+
+When the PR is stacked, `gt review` also pulls down and marks the rest of its stack: the PRs below it, nearest first, then every PR stacked above it (all branches, if several share a parent). Each walk stops at trunk, or at the first PR that is a draft, closed, from a fork, or a branch you already have locally that isn't a review branch (so your own work is never reset).
+
+The Reviewing section of `gt log` and `gt ls` draws each reviewed stack on its own, top first, above the branch it sits on, with standalone PRs listed after the stacks. `gt review` records each PR's base in `branch.<name>.gtReviewBase` so `gt ls` can do this offline, and `gt log` refreshes it whenever GitHub reports a different base.
 
 ## How `gt loc` classifies files
 

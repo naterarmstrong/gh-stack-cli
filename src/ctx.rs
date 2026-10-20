@@ -23,6 +23,9 @@ fn tracked(store: &Store, reviews: &[Review]) -> HashSet<String> {
 pub struct Review {
     pub branch: String,
     pub pr: Option<u64>,
+    /// The PR's base branch as of the last `gt review` or `gt log`
+    /// (`branch.<b>.gtReviewBase`), which places it in a stack offline.
+    pub base: Option<String>,
 }
 
 impl Review {
@@ -42,7 +45,8 @@ fn reviews(repo: &gix::Repository) -> Vec<Review> {
         .filter_map(|s| {
             let branch = s.header().subsection_name()?.to_string();
             let marker = s.value("gtReview")?.to_string();
-            Some(Review { branch, pr: marker.parse().ok() })
+            let base = s.value("gtReviewBase").map(|v| v.to_string()).filter(|v| !v.is_empty());
+            Some(Review { branch, pr: marker.parse().ok(), base })
         })
         .collect();
     v.sort_by(|a, b| a.branch.cmp(&b.branch));
