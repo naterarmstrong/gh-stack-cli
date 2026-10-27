@@ -350,7 +350,7 @@ fn render_reviews(ctx: &Ctx, prs: &HashMap<String, Pr>, detail: bool) {
     let sizes = Sizes::new(
         ctx.reviews
             .iter()
-            .filter_map(|r| Some((r.branch.clone(), untracked_loc(ctx, &r.branch, ctx.refs.head(&r.branch)?).ok()?))),
+            .filter_map(|r| Some((r.branch.clone(), review_loc(ctx, r, ctx.refs.head(&r.branch)?)?))),
     );
     let has_pr = ctx.reviews.iter().any(|r| r.pr.is_some());
     // From the remote URL, not ctx.gh(), which would look up a token.
@@ -479,16 +479,36 @@ fn branch_loc(ctx: &Ctx, stack: &Stack, idx: usize) -> Option<loc::Diff> {
 }
 
 /// The diff of `tip`'s own commits, those not reachable from `below`, measured
-/// from the parent of the oldest one so the size covers all of its work but
-/// none of what's below it (including work since squash-merged).
+/// from its best common ancestor with all of `below` so the size covers all of
+/// its work but none of what's below it (including work since squash-merged,
+/// and trunk merged into the branch).
 fn own_loc(ctx: &Ctx, tip: &str, below: &[String]) -> Option<loc::Diff> {
     let own = git::own_commits(tip, below).ok()?;
     let base = match own.first() {
         None => return Some(loc::Diff::empty(tip)),
         Some(oldest) if oldest == tip => None,
-        Some(oldest) => Some(git::rev_parse(&format!("{oldest}^"))?),
+        // On linear history this is the oldest own commit's parent; with a
+        // merge from trunk, that parent is old trunk and would count everything since.
+        Some(oldest) => Some(git::merge_base_of(tip, below).or_else(|| git::rev_parse(&format!("{oldest}^")))?),
     };
     loc::of_commit(&ctx.info.common_dir, tip, base.as_deref()).ok()
+}
+
+/// The diff of a branch pulled down by `gt review`: its own commits on top of
+/// its PR's base branch (when that's here) and trunk, as GitHub sizes the PR.
+fn review_loc(ctx: &Ctx, r: &Review, tip: &str) -> Option<loc::Diff> {
+    let trunk = ctx.default_trunk();
+    let base = r.base.as_deref().filter(|b| *b != trunk && *b != r.branch);
+    let Some(base) = base else {
+        return untracked_loc(ctx, &r.branch, tip).ok();
+    };
+    let mut below: Vec<String> = [ctx.remote_ref(&trunk), format!("refs/heads/{trunk}")]
+        .iter()
+        .chain([ctx.remote_ref(base), format!("refs/heads/{base}")].iter())
+        .filter_map(|r| git::rev_parse(r))
+        .collect();
+    below.dedup();
+    own_loc(ctx, tip, &below)
 }
 
 /// The diff of a branch no stack tracks: its own commits on top of trunk, local
@@ -517,7 +537,14 @@ pub fn loc_cmd(target: Option<String>, json: bool) -> Result<()> {
                         None => loc::of_commit(&ctx.info.common_dir, ctx.refs.head(&b).unwrap(), None)?,
                     }
                 }
-                None => untracked_loc(&ctx, &b, ctx.refs.head(&b).unwrap())?,
+                None => {
+                    let tip = ctx.refs.head(&b).unwrap();
+                    match ctx.reviews.iter().find(|r| r.branch == b) {
+                        Some(r) => review_loc(&ctx, r, tip)
+                            .ok_or_else(|| anyhow!("couldn't size {b}'s own commits against its PR base"))?,
+                        None => untracked_loc(&ctx, &b, tip)?,
+                    }
+                }
             };
             (Some(b), diff)
         }

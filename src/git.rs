@@ -256,6 +256,16 @@ pub fn merge_base(a: &str, b: &str) -> Option<String> {
     run(&["merge-base", a, b]).ok().filter(|s| !s.is_empty())
 }
 
+/// The best common ancestor of `tip` and a hypothetical merge of all of `others`.
+pub fn merge_base_of(tip: &str, others: &[String]) -> Option<String> {
+    let mut args = vec!["merge-base", tip];
+    args.extend(others.iter().filter(|o| !o.is_empty()).map(String::as_str));
+    if args.len() < 3 {
+        return None;
+    }
+    run(&args).ok().filter(|s| !s.is_empty())
+}
+
 pub struct CommitMeta {
     pub author_name: String,
     pub author_email: String,
