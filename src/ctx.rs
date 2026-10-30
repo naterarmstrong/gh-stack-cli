@@ -54,16 +54,29 @@ fn reviews(repo: &gix::Repository) -> Vec<Review> {
     v
 }
 
-/// Branches `gt sync` couldn't restack cleanly, marked by `branch.<b>.gtNeedsRebase`
-/// (value: the branch's tip at the time). A mark only counts while the tip is unchanged.
-fn rebase_marks(repo: &gix::Repository) -> HashMap<String, String> {
+/// Every branch that sets `branch.<b>.<key>` in git config, with its value.
+fn branch_values(repo: &gix::Repository, key: &str) -> HashMap<String, String> {
     let cfg = repo.config_snapshot();
     cfg.plumbing()
         .sections_by_name("branch")
         .into_iter()
         .flatten()
-        .filter_map(|s| Some((s.header().subsection_name()?.to_string(), s.value("gtNeedsRebase")?.to_string())))
+        .filter_map(|s| Some((s.header().subsection_name()?.to_string(), s.value(key)?.to_string())))
         .collect()
+}
+
+/// Branches `gt sync` couldn't restack cleanly, marked by `branch.<b>.gtNeedsRebase`
+/// (value: the branch's tip at the time). A mark only counts while the tip is unchanged.
+fn rebase_marks(repo: &gix::Repository) -> HashMap<String, String> {
+    branch_values(repo, "gtNeedsRebase")
+}
+
+/// The remote commit gt last reconciled each branch with, `branch.<b>.gtSynced`:
+/// what it last pushed there, or last took from there. The local branch is that
+/// commit plus whatever was done locally since, so it holds no edits of its own
+/// while it carries the same patch.
+fn synced(repo: &gix::Repository) -> HashMap<String, String> {
+    branch_values(repo, "gtSynced")
 }
 
 /// Each tracked branch's configured upstream: (branch.<b>.remote, branch.<b>.merge).
@@ -83,6 +96,7 @@ pub struct Ctx {
     /// Review branches that still exist locally.
     pub reviews: Vec<Review>,
     rebase_marks: HashMap<String, String>,
+    synced: HashMap<String, String>,
     upstreams: HashMap<String, (String, String)>,
     lock: Option<Lock>,
     gh: OnceCell<Client>,
@@ -104,7 +118,20 @@ impl Ctx {
         let worktrees = git::worktrees(&info.common_dir);
         let upstreams = upstreams(&repo, &tracked);
         let rebase_marks = rebase_marks(&repo);
-        Ok(Ctx { info, store, remote, refs, worktrees, reviews, rebase_marks, upstreams, lock, gh: OnceCell::new() })
+        let synced = synced(&repo);
+        Ok(Ctx {
+            info,
+            store,
+            remote,
+            refs,
+            worktrees,
+            reviews,
+            rebase_marks,
+            synced,
+            upstreams,
+            lock,
+            gh: OnceCell::new(),
+        })
     }
 
     pub fn gh(&self) -> Result<&Client> {
@@ -133,6 +160,7 @@ impl Ctx {
         self.worktrees = git::worktrees(&self.info.common_dir);
         self.upstreams = upstreams(&repo, &tracked);
         self.rebase_marks = rebase_marks(&repo);
+        self.synced = synced(&repo);
         Ok(())
     }
 
@@ -163,6 +191,20 @@ impl Ctx {
         if self.rebase_marks.remove(branch).is_some() {
             let _ = git::run(&["config", "--unset", &format!("branch.{branch}.gtNeedsRebase")]);
         }
+    }
+
+    /// The remote commit gt last pushed to or took from `branch`, if any.
+    pub fn synced(&self, branch: &str) -> Option<&str> {
+        self.synced.get(branch).map(String::as_str)
+    }
+
+    /// Records that `branch` is now reconciled with `sha` on the remote.
+    pub fn set_synced(&mut self, branch: &str, sha: &str) -> Result<()> {
+        if self.synced(branch) != Some(sha) {
+            git::run(&["config", &format!("branch.{branch}.gtSynced"), sha])?;
+            self.synced.insert(branch.to_string(), sha.to_string());
+        }
+        Ok(())
     }
 
     /// Points each branch's upstream at the same-named branch on the remote,

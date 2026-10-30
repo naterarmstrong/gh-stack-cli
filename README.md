@@ -97,12 +97,14 @@ Since `gt modify` amends the branch's one commit, the branch's reflog holds ever
 
 To fix a branch that sync skipped, run `gt checkout <branch> && gt restack --trunk`. That starts a normal `git rebase` you can finish with `gt continue` or back out of with `gt abort`. The mark is stored as `branch.<name>.gtNeedsRebase` in git config and clears once the branch restacks cleanly.
 
+When someone else pushes to your branch, even with a force push, sync replaces your local commit with theirs as long as yours has no edits the remote never had. To tell, gt records the remote commit it last pushed or pulled as `branch.<name>.gtSynced` in git config. If your local commit is that commit, or a restack of it (the same `git patch-id`), it takes the remote. For a branch gt has no record of, it asks GitHub for every commit the PR's head has pointed at, force pushes included, and takes the remote if your commit is one of them or a restack of one. This works even if another `git fetch` already brought the new commit in. If both sides changed, sync keeps yours and warns. `gt submit` refuses to push a branch whose remote holds a commit gt never synced with, so it can't overwrite someone else's push. Run `gt sync` first.
+
 `gt sync` flags:
 
 - `-a, --all`: sync every stack, not just the current one
 - `--no-prune`: keep local branches of merged PRs, review branches included
 - `--prefer-remote`: when a branch changed both locally and on the remote, take the remote (the default keeps local and warns)
-- `--offline`: skip GitHub API calls and only run git fetch (merged review branches aren't pruned)
+- `--offline`: skip GitHub API calls and only run git fetch (merged review branches aren't pruned, and branches with no `gtSynced` record can't be checked against GitHub's push history)
 
 ### Cleaning up
 

@@ -278,6 +278,26 @@ fn patch_ids(cache: &mut Cache, shas: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// The patch-id of each of `shas` that's in the repo and has a diff, sharing
+/// `gt history`'s cache. A commit missing here (pruned, or never fetched) is
+/// left out rather than cached as having no patch.
+pub fn patch_ids_of(common_dir: &Path, shas: &[&str]) -> Result<HashMap<String, String>> {
+    let repo = git::open()?;
+    let present: Vec<&str> = shas
+        .iter()
+        .copied()
+        .filter(|s| gix::ObjectId::from_hex(s.as_bytes()).is_ok_and(|id| repo.has_object(id)))
+        .collect();
+    let mut cache = Cache::load(common_dir);
+    patch_ids(&mut cache, &present)?;
+    let ids = present
+        .into_iter()
+        .filter_map(|s| Some((s.to_string(), cache.patch_ids.get(s).filter(|p| !p.is_empty())?.to_string())))
+        .collect();
+    cache.save();
+    Ok(ids)
+}
+
 // ───────────────────────────── re-applying patches ─────────────────────────────
 
 /// The tree of `sha`'s patch re-applied onto `onto`, or None if that conflicts.

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::time::Duration;
 
@@ -218,6 +219,44 @@ impl Client {
             })
             .collect();
         Ok((repo["id"].as_str().unwrap_or_default().to_string(), results))
+    }
+
+    /// Commits each PR's head branch has pointed at, as far as GitHub still
+    /// knows: the PR's current commits plus both sides of its last 100 force
+    /// pushes. A PR that can't be found maps to nothing.
+    pub fn past_heads(&self, prs: &[u64]) -> Result<HashMap<u64, HashSet<String>>> {
+        let mut out = HashMap::new();
+        for chunk in prs.chunks(50) {
+            let mut q = format!("query {{ {} {{ ", self.repo_selector());
+            for (i, n) in chunk.iter().enumerate() {
+                q += &format!(
+                    "q{i}: pullRequest(number: {n}) {{ commits(last: 100) {{ nodes {{ commit {{ oid }} }} }} \
+                     timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT], last: 100) {{ nodes {{ \
+                     ... on HeadRefForcePushedEvent {{ beforeCommit {{ oid }} afterCommit {{ oid }} }} }} }} }} "
+                );
+            }
+            q += "} }";
+            let data = self.graphql(&q)?;
+            for (i, n) in chunk.iter().enumerate() {
+                let pr = &data["repository"][format!("q{i}")];
+                if pr.is_null() {
+                    continue;
+                }
+                let oids = |v: &Value, ptrs: &[&str]| -> Vec<String> {
+                    let nodes = v["nodes"].as_array().cloned().unwrap_or_default();
+                    nodes
+                        .iter()
+                        .flat_map(|node| ptrs.iter().filter_map(|p| node.pointer(p)?.as_str().map(str::to_string)))
+                        .collect()
+                };
+                let heads: HashSet<String> = oids(&pr["commits"], &["/commit/oid"])
+                    .into_iter()
+                    .chain(oids(&pr["timelineItems"], &["/beforeCommit/oid", "/afterCommit/oid"]))
+                    .collect();
+                out.insert(*n, heads);
+            }
+        }
+        Ok(out)
     }
 
     /// Open PRs in this repo where you're asked to review by name; requests

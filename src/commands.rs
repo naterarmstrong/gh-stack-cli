@@ -348,9 +348,7 @@ fn render_reviews(ctx: &Ctx, prs: &HashMap<String, Pr>, detail: bool) {
     let cur = ctx.info.current_branch.as_deref();
     let width = ctx.reviews.iter().map(|r| r.branch.len()).max().unwrap_or(0);
     let sizes = Sizes::new(
-        ctx.reviews
-            .iter()
-            .filter_map(|r| Some((r.branch.clone(), review_loc(ctx, r, ctx.refs.head(&r.branch)?)?))),
+        ctx.reviews.iter().filter_map(|r| Some((r.branch.clone(), review_loc(ctx, r, ctx.refs.head(&r.branch)?)?))),
     );
     let has_pr = ctx.reviews.iter().any(|r| r.pr.is_some());
     // From the remote URL, not ctx.gh(), which would look up a token.
@@ -1146,8 +1144,9 @@ fn update_reviews(ctx: &Ctx) {
     }
 }
 
-/// Force-pushes branches atomically, each leased against its last known remote sha.
-fn push(ctx: &Ctx, branches: &[String], no_verify: bool) -> Result<()> {
+/// Force-pushes branches atomically, each leased against its last known remote
+/// sha, and records each pushed commit as what the branch is synced with.
+fn push(ctx: &mut Ctx, branches: &[String], no_verify: bool) -> Result<()> {
     if branches.is_empty() {
         return Ok(());
     }
@@ -1165,8 +1164,37 @@ fn push(ctx: &Ctx, branches: &[String], no_verify: bool) -> Result<()> {
     if !git::run_interactive(None, &args)? {
         bail!("git push failed");
     }
+    for b in branches {
+        if let Some(sha) = ctx.refs.head(b).map(str::to_string) {
+            ctx.set_synced(b, &sha)?;
+        }
+    }
     ui::ok(&format!("pushed {}", branches.join(", ")));
     Ok(())
+}
+
+/// Whether `sha` carries the same patch as any of `others`, so a restack of a
+/// commit matches it. A commit that isn't in this repo matches nothing.
+fn same_patch_as_any(ctx: &Ctx, sha: &str, others: &[&str]) -> bool {
+    let all: Vec<&str> = std::iter::once(sha).chain(others.iter().copied()).collect();
+    let ids = history::patch_ids_of(&ctx.info.common_dir, &all).unwrap_or_default();
+    ids.get(sha).is_some_and(|p| others.iter().any(|o| ids.get(*o) == Some(p)))
+}
+
+/// Branches whose remote-tracking ref holds a commit that gt never synced the
+/// branch with and that was never on the local branch: someone else pushed it
+/// and a fetch (sync's or any other) brought it in. The push lease is that
+/// tracking ref, so it wouldn't stop a push from overwriting it.
+fn moved_since_sync(ctx: &Ctx, branches: &[String]) -> Result<Vec<String>> {
+    let repo = git::open()?;
+    Ok(branches
+        .iter()
+        .filter(|b| {
+            let (Some(remote), Some(synced)) = (ctx.refs.remote.get(*b), ctx.synced(b)) else { return false };
+            remote != synced && !history::reflog(&repo, &format!("refs/heads/{b}")).iter().any(|e| e.sha == *remote)
+        })
+        .cloned()
+        .collect())
 }
 
 fn needs_push(ctx: &Ctx, si: usize) -> Vec<String> {
@@ -1182,7 +1210,7 @@ fn needs_push(ctx: &Ctx, si: usize) -> Vec<String> {
 
 /// Takes a remote branch that someone else pushed to (a bot fix, a teammate)
 /// and folds it back into a single commit on the branch.
-fn adopt_remote(ctx: &Ctx, branch: &str, parent_ref: &str) -> Result<()> {
+fn adopt_remote(ctx: &mut Ctx, branch: &str, parent_ref: &str) -> Result<()> {
     let remote = ctx.refs.remote[branch].clone();
     let local = ctx.refs.heads.get(branch).cloned();
     let base = match &local {
@@ -1199,6 +1227,7 @@ fn adopt_remote(ctx: &Ctx, branch: &str, parent_ref: &str) -> Result<()> {
         git::commit_tree(&git::tree_of(&remote)?, &base, &git::commit_meta(&meta_src)?)?
     };
     ctx.set_branch(branch, local.as_ref().map(|l| l.sha.as_str()), &new, "gt sync: pull remote")?;
+    ctx.set_synced(branch, &remote)?;
     ui::ok(&format!("pulled remote changes into {}", ui::bold(branch)));
     Ok(())
 }
@@ -1299,34 +1328,86 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
     // restacked still gets cleaned up.
     prune(&mut ctx, &prune_sis, &prs)?;
 
-    // 4. Pull in commits others pushed to our branches.
+    // 4. Pull in commits pushed to our branches from elsewhere (a bot fix, a
+    // teammate, another machine). A branch takes the remote when its local
+    // commit holds nothing the remote never had. The first test is what gt
+    // last synced the branch with: if local is that commit, or a restack of
+    // it, there are no local edits. Without that, GitHub's record of every
+    // commit the PR's head has pointed at stands in for it.
+    struct Pull {
+        branch: String,
+        parent_ref: String,
+        local: Option<String>,
+        pr: Option<u64>,
+        /// Whether there's evidence the remote moved past what local came from.
+        moved: bool,
+        /// Whether local holds nothing the remote never had.
+        stale: bool,
+    }
+    let mut pulls = vec![];
     for &si in &sis {
         let s = ctx.store.file.stacks[si].clone();
         for (idx, b) in s.active() {
-            let Some(new_r) = ctx.refs.remote.get(&b.branch).cloned() else { continue };
+            let Some(remote) = ctx.refs.remote.get(&b.branch).cloned() else { continue };
             let local = ctx.refs.head(&b.branch).map(str::to_string);
-            let old_r = old_remote.get(&b.branch);
-            if local.as_deref() == Some(&new_r) || old_r == Some(&new_r) {
+            if local.as_ref().is_some_and(|l| *l == remote || git::is_ancestor(&remote, l)) {
+                ctx.set_synced(&b.branch, &remote)?;
                 continue;
             }
-            if let Some(l) = &local {
-                if git::is_ancestor(&new_r, l) {
-                    continue;
+            // The remote is where gt last left it, so anything local is unpushed work.
+            let synced = ctx.synced(&b.branch).map(str::to_string);
+            if synced.as_deref() == Some(remote.as_str()) {
+                continue;
+            }
+            let old_r = old_remote.get(&b.branch);
+            let stale = match &local {
+                None => true,
+                Some(l) => {
+                    Some(l) == old_r
+                        || git::is_ancestor(l, &remote)
+                        || synced.as_deref().is_some_and(|s| s == l || same_patch_as_any(&ctx, l, &[s]))
+                }
+            };
+            let parent = s.parent_of(idx);
+            pulls.push(Pull {
+                branch: b.branch.clone(),
+                parent_ref: if parent == s.trunk.branch {
+                    ctx.remote_ref(parent)
+                } else {
+                    format!("refs/heads/{parent}")
+                },
+                local,
+                pr: prs.get(&b.branch).map(|p| p.number).or(b.pr_number()),
+                moved: synced.is_some() || old_r != Some(&remote),
+                stale,
+            });
+        }
+    }
+    let ask: Vec<u64> = pulls.iter().filter(|p| !p.stale).filter_map(|p| p.pr).collect();
+    if !ask.is_empty() && !opts.offline {
+        match ctx.gh().and_then(|gh| gh.past_heads(&ask)) {
+            Ok(heads) => {
+                for p in pulls.iter_mut().filter(|p| !p.stale) {
+                    let (Some(l), Some(h)) = (&p.local, p.pr.and_then(|n| heads.get(&n))) else { continue };
+                    let h: Vec<&str> = h.iter().map(String::as_str).collect();
+                    // Local was once the PR's head, or is a restack of one: the remote has moved on from it.
+                    if h.contains(&l.as_str()) || same_patch_as_any(&ctx, l, &h) {
+                        p.stale = true;
+                        p.moved = true;
+                    }
                 }
             }
-            let parent = s.parent_of(idx);
-            let parent_ref =
-                if parent == s.trunk.branch { ctx.remote_ref(parent) } else { format!("refs/heads/{parent}") };
-            let local_unchanged =
-                local.is_none() || local.as_ref() == old_r || git::is_ancestor(local.as_deref().unwrap(), &new_r);
-            if local_unchanged || opts.prefer_remote {
-                adopt_remote(&ctx, &b.branch, &parent_ref)?;
-            } else {
-                ui::warn(&format!(
-                    "{} changed both locally and on {} — keeping local (use --prefer-remote to take theirs)",
-                    b.branch, ctx.remote
-                ));
-            }
+            Err(e) => ui::warn(&format!("couldn't read push history from GitHub: {e:#}")),
+        }
+    }
+    for p in pulls {
+        if p.stale || (p.moved && opts.prefer_remote) {
+            adopt_remote(&mut ctx, &p.branch, &p.parent_ref)?;
+        } else if p.moved {
+            ui::warn(&format!(
+                "{} changed both locally and on {} — keeping local (use --prefer-remote to take theirs)",
+                p.branch, ctx.remote
+            ));
         }
     }
     ctx.reload()?;
@@ -1606,7 +1687,16 @@ pub fn submit(draft: bool, no_verify: bool, relink: bool) -> Result<()> {
     }
 
     let (repo_id, prs) = fetch_prs(&ctx, &[si], false)?;
-    push(&ctx, &needs_push(&ctx, si), no_verify)?;
+    let to_push = needs_push(&ctx, si);
+    let moved = moved_since_sync(&ctx, &to_push)?;
+    if !moved.is_empty() {
+        bail!(
+            "{} changed on {} since gt last synced; run `gt sync` to take or reconcile those changes before pushing",
+            moved.join(", "),
+            ctx.remote
+        );
+    }
+    push(&mut ctx, &to_push, no_verify)?;
     ctx.reload()?;
     ctx.ensure_upstreams(ctx.all_branches().iter().map(String::as_str));
 
@@ -1763,11 +1853,19 @@ pub fn get(target: String) -> Result<()> {
     for (n, head, merged) in &entries {
         if !merged {
             let remote = ctx.refs.remote.get(head).cloned().ok_or_else(|| anyhow!("{head} missing after fetch"))?;
-            match ctx.refs.head(head).map(str::to_string) {
-                None => ctx.set_branch(head, None, &remote, "gt get")?,
-                Some(l) if l == remote => {}
-                Some(l) if git::is_ancestor(&l, &remote) => ctx.set_branch(head, Some(&l), &remote, "gt get")?,
-                Some(_) => ui::warn(&format!("{head} differs from {}; keeping local (sync to reconcile)", ctx.remote)),
+            let at_remote = match ctx.refs.head(head).map(str::to_string) {
+                None => ctx.set_branch(head, None, &remote, "gt get").map(|_| true)?,
+                Some(l) if l == remote => true,
+                Some(l) if git::is_ancestor(&l, &remote) => {
+                    ctx.set_branch(head, Some(&l), &remote, "gt get").map(|_| true)?
+                }
+                Some(_) => {
+                    ui::warn(&format!("{head} differs from {}; keeping local (sync to reconcile)", ctx.remote));
+                    false
+                }
+            };
+            if at_remote {
+                ctx.set_synced(head, &remote)?;
             }
         }
         branches.push(BranchRef {
