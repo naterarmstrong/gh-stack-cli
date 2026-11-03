@@ -1,5 +1,12 @@
 //! Reads and writes `.git/gh-stack`, the same file `gh stack` uses, so both
 //! tools can be used interchangeably. Unknown fields are preserved.
+//!
+//! Branches that aren't shared with GitHub yet live in gt's own
+//! `.git/gt-stack` instead, so `gh stack submit` never opens PRs for them.
+//! Each of its stacks is either a whole local stack on a trunk, or local
+//! branches on top of a gh-stack stack (`on` names the branch they sit on).
+//! Both files load into one list of stacks, with each local branch marked
+//! `local`, and are split back apart on save.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -43,6 +50,9 @@ pub struct BranchRef {
     pub pull_request: Option<PrRef>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+    /// Kept in `.git/gt-stack` rather than `.git/gh-stack`: not submitted yet.
+    #[serde(skip)]
+    pub local: bool,
 }
 
 impl BranchRef {
@@ -71,6 +81,10 @@ pub struct Stack {
     pub branches: Vec<BranchRef>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+    /// Started in gt (`.git/gt-stack`) rather than gh-stack. Such a stack moves
+    /// into `.git/gh-stack` once any of its branches is shared.
+    #[serde(skip)]
+    pub local: bool,
 }
 
 impl Stack {
@@ -80,6 +94,11 @@ impl Stack {
 
     pub fn active(&self) -> impl Iterator<Item = (usize, &BranchRef)> {
         self.branches.iter().enumerate().filter(|(_, b)| !b.merged())
+    }
+
+    /// Unmerged branches shared with gh-stack, which get PRs and join the GitHub stack.
+    pub fn shared(&self) -> impl Iterator<Item = (usize, &BranchRef)> {
+        self.active().filter(|(_, b)| !b.local)
     }
 
     /// The branch an unmerged branch at `idx` should sit on.
@@ -144,37 +163,62 @@ impl Lock {
     }
 }
 
-pub struct Store {
-    pub path: PathBuf,
-    pub file: StackFile,
+/// `.git/gt-stack`: gt's stacks of branches that aren't shared with gh-stack.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct LocalFile {
+    schema_version: u32,
+    #[serde(default)]
+    stacks: Vec<LocalStack>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct LocalStack {
+    trunk: BranchRef,
+    /// The gh-stack branch these sit on, or empty for a stack of its own on `trunk`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    on: String,
+    branches: Vec<BranchRef>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+/// One JSON state file and the bytes it held when loaded, to catch concurrent writers.
+struct Disk {
+    path: PathBuf,
     loaded: Option<Vec<u8>>,
 }
 
-impl Store {
-    pub fn load(common_dir: &Path) -> Result<Store> {
-        let path = common_dir.join("gh-stack");
-        let (file, loaded) = match fs::read(&path) {
+impl Disk {
+    fn read<T: serde::de::DeserializeOwned>(path: PathBuf) -> Result<(Disk, Option<T>)> {
+        let name = format!(".git/{}", path.file_name().unwrap_or_default().to_string_lossy());
+        match fs::read(&path) {
             Ok(data) => {
-                let file: StackFile = serde_json::from_slice(&data).context("parsing .git/gh-stack")?;
-                if file.schema_version > 1 {
-                    bail!(".git/gh-stack has schema version {}; gt understands 1", file.schema_version);
-                }
-                (file, Some(data))
+                let v = serde_json::from_slice(&data).with_context(|| format!("parsing {name}"))?;
+                Ok((Disk { path, loaded: Some(data) }, Some(v)))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                (StackFile { schema_version: 1, repository: String::new(), stacks: vec![], extra: Map::new() }, None)
-            }
-            Err(e) => return Err(e).context("reading .git/gh-stack"),
-        };
-        Ok(Store { path, file, loaded })
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Disk { path, loaded: None }, None)),
+            Err(e) => Err(e).with_context(|| format!("reading {name}")),
+        }
     }
 
-    pub fn save(&mut self, _lock: &Lock) -> Result<()> {
-        let current = fs::read(&self.path).ok();
-        if current != self.loaded {
-            bail!(".git/gh-stack changed on disk while gt was running; re-run the command");
+    fn check(&self) -> Result<()> {
+        if fs::read(&self.path).ok() != self.loaded {
+            let name = self.path.file_name().unwrap_or_default().to_string_lossy();
+            bail!(".git/{name} changed on disk while gt was running; re-run the command");
         }
-        let data = serde_json::to_vec_pretty(&self.file)?;
+        Ok(())
+    }
+
+    /// Writes `v` unless the file would be unchanged, or would be created with nothing in it.
+    fn write<T: Serialize>(&mut self, v: &T, empty: bool) -> Result<()> {
+        if self.loaded.is_none() && empty {
+            return Ok(());
+        }
+        let data = serde_json::to_vec_pretty(v)?;
         if Some(&data) == self.loaded.as_ref() {
             return Ok(());
         }
@@ -187,5 +231,83 @@ impl Store {
         fs::rename(&tmp, &self.path)?;
         self.loaded = Some(data);
         Ok(())
+    }
+}
+
+pub struct Store {
+    /// Every stack, gh-stack's first, with gt's local branches merged in.
+    pub file: StackFile,
+    gh: Disk,
+    local: Disk,
+    local_extra: Map<String, Value>,
+}
+
+impl Store {
+    pub fn load(common_dir: &Path) -> Result<Store> {
+        let (gh, file) = Disk::read::<StackFile>(common_dir.join("gh-stack"))?;
+        let mut file = file.unwrap_or(StackFile {
+            schema_version: 1,
+            repository: String::new(),
+            stacks: vec![],
+            extra: Map::new(),
+        });
+        if file.schema_version > 1 {
+            bail!(".git/gh-stack has schema version {}; gt understands 1", file.schema_version);
+        }
+        let (local, mine) = Disk::read::<LocalFile>(common_dir.join("gt-stack"))?;
+        let mine = mine.unwrap_or(LocalFile { schema_version: 1, stacks: vec![], extra: Map::new() });
+        if mine.schema_version > 1 {
+            bail!(".git/gt-stack has schema version {}; gt understands 1", mine.schema_version);
+        }
+        for ls in mine.stacks {
+            // A branch gh-stack also tracks now (say, `gh stack add`) belongs to gh-stack.
+            let branches: Vec<BranchRef> = ls
+                .branches
+                .into_iter()
+                .filter(|b| file.find(&b.branch).is_none())
+                .map(|b| BranchRef { local: true, ..b })
+                .collect();
+            match file.find(&ls.on).filter(|_| !ls.on.is_empty()) {
+                // If gh-stack grew above `on` meanwhile, the local branches move up on top of it.
+                Some(si) => file.stacks[si].branches.extend(branches),
+                None if branches.is_empty() => {}
+                None => file.stacks.push(Stack {
+                    trunk: ls.trunk,
+                    branches,
+                    extra: ls.extra,
+                    local: true,
+                    ..Default::default()
+                }),
+            }
+        }
+        Ok(Store { file, gh, local, local_extra: mine.extra })
+    }
+
+    pub fn save(&mut self, _lock: &Lock) -> Result<()> {
+        self.gh.check()?;
+        self.local.check()?;
+        let mut gh = StackFile { stacks: vec![], ..self.file.clone() };
+        let mut mine = LocalFile { schema_version: 1, stacks: vec![], extra: self.local_extra.clone() };
+        for s in &self.file.stacks {
+            // gh-stack can't hold a branch above one it doesn't know, so everything at or
+            // below the highest shared branch is shared.
+            let split = s.branches.iter().rposition(|b| !b.local).map_or(0, |i| i + 1);
+            let (shared, local) = s.branches.split_at(split);
+            if !shared.is_empty() || !s.local {
+                gh.stacks.push(Stack { branches: shared.to_vec(), ..s.clone() });
+            }
+            if !local.is_empty() {
+                mine.stacks.push(LocalStack {
+                    trunk: s.trunk.clone(),
+                    on: shared.last().map(|b| b.branch.clone()).unwrap_or_default(),
+                    branches: local.to_vec(),
+                    extra: if shared.is_empty() { s.extra.clone() } else { Map::new() },
+                });
+            }
+        }
+        let empty = gh.stacks.is_empty();
+        self.gh.write(&gh, empty)?;
+        let empty = mine.stacks.is_empty();
+        self.local.write(&mine, empty)
     }
 }

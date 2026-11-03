@@ -2,7 +2,7 @@
 
 A fast, Graphite-style CLI for stacked PRs, built on `gh stack`'s state and GitHub's stacks API.
 
-`gt` reads and writes the same `.git/gh-stack` file that `gh stack` uses (unknown fields are kept, and it takes the same lock files), so you can switch between the two tools freely. It restacks in memory with `git merge-tree` + `git commit-tree`, so restacking never checks out a branch or touches a working tree, and it batches GitHub calls into single GraphQL round trips.
+`gt` reads and writes the same `.git/gh-stack` file that `gh stack` uses (unknown fields are kept, and it takes the same lock files), so you can switch between the two tools freely. Branches you haven't submitted yet live in gt's own `.git/gt-stack` instead (see [Local branches](#local-branches)), so `gh stack submit` never opens PRs for them. It restacks in memory with `git merge-tree` + `git commit-tree`, so restacking never checks out a branch or touches a working tree, and it batches GitHub calls into single GraphQL round trips.
 
 **It assumes one commit per branch.** That rule keeps restacking simple: a branch's old base is always its tip's parent. `gt squash` folds a branch with several commits back into one.
 
@@ -79,7 +79,7 @@ Since `gt modify` amends the branch's one commit, the branch's reflog holds ever
 
 | Command | What it does |
 | --- | --- |
-| `gt create [name] -m <msg>` (`c`) | Create a branch above the current one and commit staged changes to it. `-a` stages everything first. The name comes from the message if you leave it out. |
+| `gt create [name] -m <msg>` (`c`) | Create a branch above the current one and commit staged changes to it. `-a` stages everything first. The name comes from the message if you leave it out. The branch is local until submitted, unless it goes below a branch that's already shared. |
 | `gt modify` (`m`) | Amend the current branch's commit (or make the first one if the branch has none), then restack everything above it. On a branch outside any stack it just amends (or makes the first commit on top of trunk), with nothing to restack. `-a` stages everything, `-m` replaces the message. |
 | `gt restack` (`r`) | Rebase each branch onto its parent, in memory. `--trunk` also moves the bottom branch onto the latest remote trunk. |
 | `gt squash` | Fold each branch in the stack down to one commit. The content stays the same. |
@@ -90,10 +90,10 @@ Since `gt modify` amends the branch's one commit, the branch's reflog holds ever
 
 | Command | What it does |
 | --- | --- |
-| `gt submit` (`ss`) | Restack, push, create PRs (title and body from the commit message) or retarget them onto the right base, and link the stack on GitHub. `--draft` opens new PRs as drafts. `--relink` replaces the GitHub stack if it doesn't match the local order. |
+| `gt submit` (`ss`) | Restack, push, create PRs (title and body from the commit message) or retarget them onto the right base, and link the stack on GitHub. This shares the current branch and every local branch below it; local branches above it stay local (restacked, not pushed). `--draft` opens new PRs as drafts. `--relink` replaces the GitHub stack if it doesn't match the local order. |
 | `gt sync` (`s`) | Fetch, mark merged PRs, pull in commits others pushed to your branches, fast-forward local trunks (including ones checked out in other worktrees), and restack onto trunk. It never pushes: it lists the branches that changed and aren't pushed, and `gt submit` pushes them. A branch that would conflict is left where it is and marked **needs rebase** in `gt log`/`gt ls`; the branches above it are restacked onto it. Sync never stops for a conflict or checks out a branch. See flags below. |
 | `gt get <target>` | Pull down a stack from GitHub by PR number, URL or branch. |
-| `gt track [branches…]` | Start tracking existing branches (bottom first) as a stack. Defaults to the current branch. `--trunk` sets the trunk. |
+| `gt track [branches…]` | Start tracking existing branches (bottom first) as a local stack. Defaults to the current branch. `--trunk` sets the trunk. |
 
 To fix a branch that sync skipped, run `gt checkout <branch> && gt restack --trunk`. That starts a normal `git rebase` you can finish with `gt continue` or back out of with `gt abort`. The mark is stored as `branch.<name>.gtNeedsRebase` in git config and clears once the branch restacks cleanly.
 
@@ -105,6 +105,16 @@ When someone else pushes to your branch, even with a force push, sync replaces y
 - `--no-prune`: keep local branches of merged PRs, review branches included
 - `--prefer-remote`: when a branch changed both locally and on the remote, take the remote (the default keeps local and warns)
 - `--offline`: skip GitHub API calls and only run git fetch (merged review branches aren't pruned, and branches with no `gtSynced` record can't be checked against GitHub's push history)
+
+### Local branches
+
+A branch is either **shared**, kept in `.git/gh-stack` where `gh stack` sees it, or **local**, kept in gt's `.git/gt-stack`. `gt create` and `gt track` make local branches; `gt get` and `gt submit` make shared ones. gt shows both as one stack: with `A` submitted and `B` and `C` created on top of it, `gt ls` draws `A ← B ← C`, and restack, sync and navigation treat them as one stack. Only shared branches are pushed, get PRs, and join the GitHub stack.
+
+`gt submit` on `B` shares `A` and `B` (opening both PRs and stacking them on GitHub) and leaves `C` local on top. A local branch that's pushed but has no PR stays local.
+
+When `gt sync` finds that a local branch has a PR (opened some other way), it shares the branch if the PR's base is the branch below it and GitHub already stacks the two PRs. If GitHub doesn't stack them, sync asks whether to stack them there; say no and it won't ask again for that PR (`branch.<name>.gtNoLink`), though `gt submit` from the branch still stacks it. Without a terminal it only prints a hint. A PR based on some other branch stays local, with a warning. Only the lowest local branches can be shared this way, since gh-stack can't skip one.
+
+Each `.git/gt-stack` entry is either a whole stack on a trunk, or local branches on top of a gh-stack stack (`on` names the branch below them). If `gh stack add` later adds one of those branches to gh-stack, gh-stack's copy wins.
 
 ### Cleaning up
 
@@ -151,7 +161,7 @@ cargo fmt      # max_width = 120, see rustfmt.toml
 | --- | --- |
 | `src/main.rs` | CLI definition (clap) |
 | `src/commands.rs` | Every subcommand |
-| `src/state.rs` | `.git/gh-stack` read/write and locking |
+| `src/state.rs` | `.git/gh-stack` and `.git/gt-stack` read/write and locking |
 | `src/ctx.rs` | Repo context: refs, worktrees, review branches, stack store |
 | `src/restack.rs` | In-memory restack and squash |
 | `src/git.rs` | Git plumbing (gix plus the `git` binary) |

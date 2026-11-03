@@ -789,11 +789,12 @@ pub fn create(name: Option<String>, message: Option<String>, all: bool) -> Resul
             let is_trunk = cur == ctx.default_trunk() || ctx.store.file.stacks.iter().any(|s| s.trunk.branch == cur);
             let mut stack = Stack {
                 trunk: BranchRef::new(&if is_trunk { cur.clone() } else { ctx.default_trunk() }),
+                local: true,
                 ..Default::default()
             };
             if !is_trunk {
                 ui::info(&format!("tracking {} as the bottom of a new stack", ui::bold(&cur)));
-                stack.branches.push(BranchRef::new(&cur));
+                stack.branches.push(BranchRef { local: true, ..BranchRef::new(&cur) });
             }
             let at = stack.branches.len();
             ctx.store.file.stacks.push(stack);
@@ -817,7 +818,10 @@ pub fn create(name: Option<String>, message: Option<String>, all: bool) -> Resul
         ui::warn("nothing staged; created an empty branch (commit, then `gt modify`)");
     }
 
-    ctx.store.file.stacks[si].branches.insert(insert_at, BranchRef::new(&name));
+    // New branches stay local until submitted, unless one above them is already shared.
+    let stack = &mut ctx.store.file.stacks[si];
+    let local = stack.branches[insert_at..].iter().all(|b| b.local);
+    stack.branches.insert(insert_at, BranchRef { local, ..BranchRef::new(&name) });
     ctx.reload()?;
     ui::ok(&format!("created {}", ui::bold(&name)));
     let clean = if insert_at + 1 < ctx.store.file.stacks[si].branches.len() {
@@ -998,7 +1002,8 @@ pub fn track(branches: Vec<String>, trunk: Option<String>) -> Result<()> {
     }
     ctx.store.file.stacks.push(Stack {
         trunk: BranchRef::new(&trunk),
-        branches: branches.iter().map(|b| BranchRef::new(b)).collect(),
+        branches: branches.iter().map(|b| BranchRef { local: true, ..BranchRef::new(b) }).collect(),
+        local: true,
         ..Default::default()
     });
     ctx.reload()?;
@@ -1197,9 +1202,11 @@ fn moved_since_sync(ctx: &Ctx, branches: &[String]) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Shared branches whose remote branch isn't the local one. Local-only
+/// branches wait for `gt submit` to share them.
 fn needs_push(ctx: &Ctx, si: usize) -> Vec<String> {
     ctx.store.file.stacks[si]
-        .active()
+        .shared()
         .filter(|(_, b)| {
             ctx.refs.head(&b.branch).is_some()
                 && ctx.refs.head(&b.branch) != ctx.refs.remote.get(&b.branch).map(String::as_str)
@@ -1457,6 +1464,10 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         }
     }
 
+    if !opts.offline {
+        share_local_prs(&mut ctx, &sis, &prs)?;
+    }
+
     // Sync never pushes; `gt submit` does, once you've looked at the result.
     let unpushed: Vec<String> =
         restacked.iter().flat_map(|&si| needs_push(&ctx, si)).filter(|b| ctx.refs.remote.contains_key(b)).collect();
@@ -1480,6 +1491,87 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
             "\n{} changed locally and aren't pushed; `gt submit` pushes them.",
             unpushed.iter().map(|b| ui::bold(b)).collect::<Vec<_>>().join(", ")
         );
+    }
+    Ok(())
+}
+
+/// Git config key holding the PR number whose stacking the user declined.
+fn no_link_key(branch: &str) -> String {
+    format!("branch.{branch}.gtNoLink")
+}
+
+/// Shares local-only branches that turn out to have a PR (opened by hand or by
+/// another tool), lowest first, as long as each PR is based on the branch below
+/// it. When GitHub doesn't stack the PR with the one below, asks whether to.
+fn share_local_prs(ctx: &mut Ctx, sis: &[usize], prs: &HashMap<String, Pr>) -> Result<()> {
+    for &si in sis {
+        let stack = ctx.store.file.stacks[si].clone();
+        // Only the lowest local branches can be shared: gh-stack can't skip one.
+        for (idx, b) in stack.active().filter(|(_, b)| b.local) {
+            let Some(pr) = prs.get(&b.branch).filter(|p| p.state == "OPEN") else { break };
+            let (n, parent) = (pr.number, stack.parent_of(idx));
+            if pr.base_ref_name != parent {
+                ui::warn(&format!(
+                    "{}'s PR #{n} is based on {}, but it's stacked on {parent} here; keeping it local-only",
+                    b.branch, pr.base_ref_name
+                ));
+                break;
+            }
+            let share = |ctx: &mut Ctx| ctx.store.file.stacks[si].branches[idx].local = false;
+            if parent == stack.trunk.branch {
+                share(ctx);
+                continue;
+            }
+            let Some(parent_pr) = stack.branches.iter().find(|x| x.branch == parent).and_then(BranchRef::pr_number)
+            else {
+                break;
+            };
+            match ctx.gh()?.stack_for_pr(n)? {
+                Some(r) if r.pull_requests.iter().any(|p| p.number == parent_pr) => {
+                    share(ctx);
+                    continue;
+                }
+                Some(r) => {
+                    ui::warn(&format!(
+                        "{}'s PR #{n} is in GitHub stack #{} without #{parent_pr}; keeping it local-only",
+                        b.branch, r.number
+                    ));
+                    break;
+                }
+                None => {}
+            }
+            if git::run(&["config", "--get", &no_link_key(&b.branch)]).ok() == Some(n.to_string()) {
+                break;
+            }
+            let question = format!(
+                "{} has PR #{n} on {parent}, but GitHub doesn't stack it with #{parent_pr}. Stack them on GitHub?",
+                b.branch
+            );
+            match picker::confirm(&question) {
+                Ok(true) => {
+                    share(ctx);
+                    if let Err(e) = link_stack(ctx, si, false) {
+                        ctx.store.file.stacks[si].branches[idx].local = true;
+                        ui::warn(&format!("couldn't stack #{n} on GitHub: {e:#}"));
+                        break;
+                    }
+                    ui::ok(&format!("stacked #{n} on #{parent_pr} on GitHub"));
+                }
+                Ok(false) => {
+                    git::run(&["config", &no_link_key(&b.branch), &n.to_string()])?;
+                    ui::info(&format!("keeping {} local-only; `gt submit` from it stacks it", b.branch));
+                    break;
+                }
+                Err(_) => {
+                    ui::info(&format!(
+                        "{} has PR #{n} on {parent}, not stacked with #{parent_pr} on GitHub; run `gt sync` in a \
+                         terminal to stack them, or `gt submit` from {}",
+                        b.branch, b.branch
+                    ));
+                    break;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1681,6 +1773,12 @@ pub fn clear_merged(force: bool, diverged: bool) -> Result<()> {
 pub fn submit(draft: bool, no_verify: bool, relink: bool) -> Result<()> {
     let mut ctx = Ctx::new(true)?;
     let si = ctx.current_stack()?;
+    // Submitting shares the current branch and everything below it with gh-stack;
+    // local branches above it stay local.
+    let idx = ctx.store.file.stacks[si].index_of(ctx.current()?).unwrap();
+    for b in &mut ctx.store.file.stacks[si].branches[..=idx] {
+        b.local = false;
+    }
     if !restack::run(&mut ctx, si, false)? {
         ctx.save()?;
         std::process::exit(1);
@@ -1703,7 +1801,7 @@ pub fn submit(draft: bool, no_verify: bool, relink: bool) -> Result<()> {
     let stack = ctx.store.file.stacks[si].clone();
     let mut batch = MutationBatch::default();
     let mut created = vec![];
-    for (idx, b) in stack.active() {
+    for (idx, b) in stack.shared() {
         let parent = stack.parent_of(idx);
         match prs.get(&b.branch).filter(|p| p.state == "OPEN") {
             Some(pr) if pr.base_ref_name != parent => {
@@ -1726,7 +1824,7 @@ pub fn submit(draft: bool, no_verify: bool, relink: bool) -> Result<()> {
 
     // Record PR refs: existing ones from the query, new ones from the mutation.
     let stack = &mut ctx.store.file.stacks[si];
-    for (idx, b) in stack.branches.iter_mut().enumerate() {
+    for (idx, b) in stack.branches.iter_mut().enumerate().filter(|(_, b)| !b.local) {
         if let Some(pr) = prs.get(&b.branch).filter(|p| p.state == "OPEN") {
             b.pull_request =
                 Some(PrRef { number: pr.number, id: pr.id.clone(), url: pr.url.clone(), ..Default::default() });
@@ -1751,10 +1849,15 @@ pub fn submit(draft: bool, no_verify: bool, relink: bool) -> Result<()> {
     ctx.save()?;
 
     let gh = ctx.gh()?;
-    for (_, b) in ctx.store.file.stacks[si].active().collect::<Vec<_>>().into_iter().rev() {
+    let stack = &ctx.store.file.stacks[si];
+    for (_, b) in stack.shared().collect::<Vec<_>>().into_iter().rev() {
         if let Some(n) = b.pr_number() {
             println!("{:<40} {}", b.branch, gh.pr_url(n));
         }
+    }
+    let above: Vec<String> = stack.active().filter(|(_, b)| b.local).map(|(_, b)| ui::bold(&b.branch)).collect();
+    if !above.is_empty() {
+        ui::info(&format!("{} stay local; submit from one to share it", above.join(", ")));
     }
     Ok(())
 }
@@ -1762,7 +1865,7 @@ pub fn submit(draft: bool, no_verify: bool, relink: bool) -> Result<()> {
 /// Makes GitHub's stack object match the local order of open PRs.
 fn link_stack(ctx: &mut Ctx, si: usize, relink: bool) -> Result<()> {
     let stack = &ctx.store.file.stacks[si];
-    let open: Vec<u64> = stack.active().filter_map(|(_, b)| b.pr_number()).collect();
+    let open: Vec<u64> = stack.shared().filter_map(|(_, b)| b.pr_number()).collect();
     if open.len() < 2 {
         return Ok(());
     }

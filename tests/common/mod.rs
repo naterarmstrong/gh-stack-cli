@@ -173,6 +173,88 @@ impl World {
         }
     }
 
+    /// Runs gt in the clone with a pseudo-terminal as its controlling terminal,
+    /// typing each of `answers` (plus Enter) as a `[y/N]` prompt shows up.
+    /// Returns what gt wrote to the terminal (prompts, and the echo of what was
+    /// typed) beside its output. A prompt with no answer left fails the test.
+    pub fn gt_with_tty(&self, args: &[&str], answers: &[&str]) -> (Out, String) {
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+        use std::sync::{Arc, Mutex};
+        let (mut master, mut slave) = (0, 0);
+        let rc = unsafe {
+            libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(rc, 0, "openpty failed");
+        // Keep both ends out of every other process spawned meanwhile; gt only
+        // needs the terminal to be its controlling one, set up before exec.
+        unsafe {
+            libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        let slave_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(slave) };
+        let mut tty = unsafe { std::fs::File::from_raw_fd(master) };
+
+        // Reads the terminal, answering each prompt as it appears.
+        let screen = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let answers: Vec<String> = answers.iter().map(|a| format!("{a}\n")).collect();
+        let reader = {
+            let screen = screen.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 1024];
+                let mut answered = 0;
+                // Ends once gt exits and the last handle on the terminal closes.
+                while let Ok(n @ 1..) = tty.read(&mut buf) {
+                    let mut s = screen.lock().unwrap();
+                    s.extend_from_slice(&buf[..n]);
+                    let prompts = String::from_utf8_lossy(&s).matches("[y/N]").count();
+                    while answered < prompts.min(answers.len()) {
+                        let _ = tty.write_all(answers[answered].as_bytes());
+                        answered += 1;
+                    }
+                }
+            })
+        };
+
+        let mut c = Command::new(env!("CARGO_BIN_EXE_gt"));
+        c.current_dir(&self.repo).args(args);
+        self.env(&mut c);
+        // After env()'s setsid, the pty becomes the new session's terminal.
+        unsafe {
+            c.pre_exec(move || {
+                if libc::ioctl(slave, libc::TIOCSCTTY as _, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let child = c.spawn().expect("running gt");
+        let pid = child.id() as i32;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(child.wait_with_output()));
+        // A prompt nothing answers would wait forever; fail instead.
+        let out = match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(out) => out.expect("running gt"),
+            Err(_) => {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                drop(slave_fd);
+                let s = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
+                panic!("gt {} hung; terminal:\n{s}", args.join(" "));
+            }
+        };
+        // The reader stops once nothing holds the terminal open.
+        drop(slave_fd);
+        let _ = reader.join();
+        let out = Out {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        };
+        let screen = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
+        (out, screen)
+    }
+
     /// Runs gt in the clone, whatever the outcome.
     pub fn gt(&self, args: &[&str]) -> Out {
         self.gt_in(&self.repo, args)
@@ -282,8 +364,14 @@ impl World {
         std::fs::canonicalize(self.repo.join(d)).unwrap()
     }
 
+    /// `.git/gh-stack`: what gh-stack sees.
     pub fn state_path(&self) -> PathBuf {
         self.common_dir().join("gh-stack")
+    }
+
+    /// `.git/gt-stack`: gt's local-only branches.
+    pub fn local_state_path(&self) -> PathBuf {
+        self.common_dir().join("gt-stack")
     }
 
     /// `.git/gh-stack` as JSON.
@@ -291,42 +379,90 @@ impl World {
         serde_json::from_slice(&std::fs::read(self.state_path()).expect("no .git/gh-stack")).unwrap()
     }
 
+    /// `.git/gt-stack` as JSON.
+    pub fn local_state(&self) -> Value {
+        serde_json::from_slice(&std::fs::read(self.local_state_path()).expect("no .git/gt-stack")).unwrap()
+    }
+
     pub fn write_state(&self, v: &Value) {
         std::fs::write(self.state_path(), serde_json::to_vec_pretty(v).unwrap()).unwrap();
     }
 
-    /// Branch names of each stack, bottom first.
-    pub fn stacks(&self) -> Vec<Vec<String>> {
-        let s = self.state();
-        s["stacks"]
-            .as_array()
-            .map(|stacks| {
-                stacks
-                    .iter()
-                    .map(|st| {
-                        st["branches"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .map(|b| b["branch"].as_str().unwrap().to_string())
-                            .collect()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+    pub fn write_local_state(&self, v: &Value) {
+        std::fs::write(self.local_state_path(), serde_json::to_vec_pretty(v).unwrap()).unwrap();
     }
 
-    /// One stacked branch's entry in `.git/gh-stack`.
+    fn read_json(path: &Path) -> Value {
+        std::fs::read(path).map(|d| serde_json::from_slice(&d).unwrap()).unwrap_or(Value::Null)
+    }
+
+    /// Branch names of each stack in one state file, bottom first.
+    fn names(v: &Value) -> Vec<Vec<String>> {
+        let branches = |st: &Value| -> Vec<String> {
+            st["branches"].as_array().unwrap().iter().map(|b| b["branch"].as_str().unwrap().to_string()).collect()
+        };
+        v["stacks"].as_array().map(|s| s.iter().map(branches).collect()).unwrap_or_default()
+    }
+
+    /// Branch names of each gh-stack stack.
+    pub fn shared_stacks(&self) -> Vec<Vec<String>> {
+        World::names(&World::read_json(&self.state_path()))
+    }
+
+    /// Branch names of each gt-stack entry (local branches, on a trunk or on top of a gh-stack stack).
+    pub fn local_stacks(&self) -> Vec<Vec<String>> {
+        World::names(&World::read_json(&self.local_state_path()))
+    }
+
+    /// Branch names of each stack as gt sees it, both files merged: gh-stack's
+    /// stacks first, with local branches on top, then local-only stacks.
+    pub fn stacks(&self) -> Vec<Vec<String>> {
+        let gh = World::read_json(&self.state_path());
+        let local = World::read_json(&self.local_state_path());
+        let mut stacks = World::names(&gh);
+        let empty = vec![];
+        for (ls, names) in local["stacks"].as_array().unwrap_or(&empty).iter().zip(World::names(&local)) {
+            let on = ls["on"].as_str().unwrap_or_default();
+            match stacks.iter_mut().find(|s| !on.is_empty() && s.iter().any(|b| b == on)) {
+                Some(s) => s.extend(names),
+                None => stacks.push(names),
+            }
+        }
+        stacks
+    }
+
+    /// One stacked branch's entry, from whichever state file holds it.
     pub fn branch_state(&self, branch: &str) -> Value {
-        let s = self.state();
-        for st in s["stacks"].as_array().unwrap() {
-            for b in st["branches"].as_array().unwrap() {
-                if b["branch"] == branch {
-                    return b.clone();
+        for path in [self.state_path(), self.local_state_path()] {
+            let s = World::read_json(&path);
+            for st in s["stacks"].as_array().into_iter().flatten() {
+                for b in st["branches"].as_array().unwrap() {
+                    if b["branch"] == branch {
+                        return b.clone();
+                    }
                 }
             }
         }
-        panic!("{branch} isn't in .git/gh-stack:\n{s:#}");
+        panic!("{branch} isn't in .git/gh-stack or .git/gt-stack");
+    }
+
+    /// Edits a stacked branch's entry in place, in whichever state file holds it.
+    pub fn edit_branch_state(&self, branch: &str, f: impl FnOnce(&mut Value)) {
+        for path in [self.state_path(), self.local_state_path()] {
+            let mut s = World::read_json(&path);
+            let found = s["stacks"]
+                .as_array_mut()
+                .into_iter()
+                .flatten()
+                .flat_map(|st| st["branches"].as_array_mut().unwrap().iter_mut())
+                .find(|b| b["branch"] == branch);
+            if let Some(b) = found {
+                f(b);
+                std::fs::write(&path, serde_json::to_vec_pretty(&s).unwrap()).unwrap();
+                return;
+            }
+        }
+        panic!("{branch} isn't in .git/gh-stack or .git/gt-stack");
     }
 
     /// A second clone standing in for a teammate or bot pushing to origin.

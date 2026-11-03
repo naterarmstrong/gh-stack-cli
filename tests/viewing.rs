@@ -16,15 +16,7 @@ fn three_branches() -> World {
 
 /// Records a PR number for a stacked branch, as `gt submit` or `gt sync` would.
 fn set_pr(w: &World, branch: &str, number: u64, merged: bool) {
-    let mut s = w.state();
-    for st in s["stacks"].as_array_mut().unwrap() {
-        for b in st["branches"].as_array_mut().unwrap() {
-            if b["branch"] == branch {
-                b["pullRequest"] = json!({ "number": number, "merged": merged });
-            }
-        }
-    }
-    w.write_state(&s);
+    w.edit_branch_state(branch, |b| b["pullRequest"] = json!({ "number": number, "merged": merged }));
 }
 
 #[test]

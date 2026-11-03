@@ -15,9 +15,12 @@ fn create_from_trunk_starts_a_stack() {
     assert_eq!(w.parent("feat-a"), main);
     assert_eq!(w.show("feat-a", "a.txt").as_deref(), Some("a\n"));
     assert_eq!(w.stacks(), vec![vec!["feat-a"]]);
-    let state = w.state();
+    // Not submitted, so it's gt's alone: gh-stack doesn't see it.
+    assert!(!w.state_path().exists());
+    let state = w.local_state();
     assert_eq!(state["schemaVersion"], 1);
     assert_eq!(state["stacks"][0]["trunk"]["branch"], "main");
+    assert_eq!(state["stacks"][0].get("on"), None);
     let b = w.branch_state("feat-a");
     assert_eq!(b["head"], w.head("feat-a").unwrap().as_str());
     assert_eq!(b["base"], main.as_str());
@@ -352,7 +355,7 @@ fn track_defaults_to_the_current_branch_and_takes_a_trunk() {
     w.commit("f.txt", "f\n", "Fix");
     w.gt_ok(&["track", "--trunk", "release"]);
     assert_eq!(w.stacks(), vec![vec!["fix"]]);
-    assert_eq!(w.state()["stacks"][0]["trunk"]["branch"], "release");
+    assert_eq!(w.local_state()["stacks"][0]["trunk"]["branch"], "release");
 }
 
 #[test]
@@ -423,27 +426,38 @@ fn mutating_commands_respect_gh_stack_locks() {
 fn unknown_state_fields_survive_a_rewrite() {
     let w = World::new();
     w.create("feat-a", "a.txt", "a\n");
-    let mut s = w.state();
-    s["fromGhStack"] = "keep me".into();
-    s["stacks"][0]["branches"][0]["custom"] = serde_json::json!({ "n": 1 });
-    w.write_state(&s);
+    // A stack gh-stack made, with fields gt doesn't know.
+    w.git(&["branch", "theirs", "main"]);
+    w.write_state(&serde_json::json!({
+        "schemaVersion": 1,
+        "repository": "acme/widgets",
+        "fromGhStack": "keep me",
+        "stacks": [{ "trunk": { "branch": "main" }, "branches": [{ "branch": "theirs", "custom": { "n": 1 } }] }],
+    }));
+    w.edit_branch_state("feat-a", |b| b["mine"] = "too".into());
 
     w.create("feat-b", "b.txt", "b\n");
     let s = w.state();
     assert_eq!(s["fromGhStack"], "keep me");
+    assert_eq!(s["repository"], "acme/widgets");
     assert_eq!(s["stacks"][0]["branches"][0]["custom"]["n"], 1);
-    assert_eq!(w.stacks(), vec![vec!["feat-a", "feat-b"]]);
+    assert_eq!(w.branch_state("feat-a")["mine"], "too");
+    assert_eq!(w.stacks(), vec![vec!["theirs"], vec!["feat-a", "feat-b"]]);
 }
 
 #[test]
 fn newer_state_schema_is_refused() {
     let w = World::new();
     w.create("feat-a", "a.txt", "a\n");
-    let mut s = w.state();
+    let mut s = w.local_state();
     s["schemaVersion"] = 2.into();
-    w.write_state(&s);
+    w.write_local_state(&s);
     let out = w.gt_err(&["ls"]);
-    assert!(out.stderr.contains("schema version 2"), "{out:?}");
+    assert!(out.stderr.contains(".git/gt-stack has schema version 2"), "{out:?}");
+    std::fs::remove_file(w.local_state_path()).unwrap();
+    w.write_state(&serde_json::json!({ "schemaVersion": 2, "stacks": [] }));
+    let out = w.gt_err(&["ls"]);
+    assert!(out.stderr.contains(".git/gh-stack has schema version 2"), "{out:?}");
 }
 
 #[test]
