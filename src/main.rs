@@ -62,6 +62,9 @@ enum Cmd {
         /// Stage all changes first
         #[arg(short, long)]
         all: bool,
+        /// Branch to create the new branch above (name or PR number) instead of the current one
+        #[arg(long)]
+        base: Option<String>,
     },
     /// Amend the current branch's commit and restack everything above it
     #[command(visible_alias = "m")]
@@ -230,7 +233,7 @@ fn main() {
         Cmd::Bottom => commands::nav(Nav::Bottom),
         Cmd::Trunk => commands::nav(Nav::Trunk),
         Cmd::Checkout { target } => commands::checkout_cmd(target),
-        Cmd::Create { name, message, all } => commands::create(name, message, all),
+        Cmd::Create { name, message, all, base } => commands::create(name, message, all, base),
         Cmd::Modify { all, message } => commands::modify(all, message),
         Cmd::Restack { trunk } => commands::restack_cmd(trunk),
         Cmd::Squash => commands::squash_cmd(),

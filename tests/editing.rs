@@ -96,6 +96,45 @@ fn create_on_an_untracked_branch_tracks_it_as_the_bottom() {
 }
 
 #[test]
+fn create_with_base_starts_a_stack_on_trunk_from_anywhere() {
+    let w = World::new();
+    let main = w.head("main").unwrap();
+    w.create("feat-a", "a.txt", "a\n");
+    w.write("x.txt", "x\n");
+    w.gt_ok(&["create", "--base", "main", "-am", "Other work"]);
+
+    assert_eq!(w.current(), "other_work");
+    assert_eq!(w.parent("other_work"), main);
+    assert_eq!(w.show("other_work", "a.txt"), None);
+    assert_eq!(w.show("other_work", "x.txt").as_deref(), Some("x\n"));
+    assert_eq!(w.stacks(), vec![vec!["feat-a"], vec!["other_work"]]);
+}
+
+#[test]
+fn create_with_base_inserts_above_that_branch() {
+    let w = World::new();
+    w.create("feat-a", "a.txt", "a\n");
+    w.create("feat-c", "c.txt", "c\n");
+    w.write("b.txt", "b\n");
+    w.gt_ok(&["create", "feat-b", "--base", "feat-a", "-am", "b"]);
+
+    assert_eq!(w.current(), "feat-b");
+    assert_eq!(w.stacks(), vec![vec!["feat-a", "feat-b", "feat-c"]]);
+    assert_eq!(w.parent("feat-b"), w.head("feat-a").unwrap());
+    assert_eq!(w.parent("feat-c"), w.head("feat-b").unwrap());
+    assert_eq!(w.show("feat-c", "b.txt").as_deref(), Some("b\n"));
+}
+
+#[test]
+fn create_with_an_unknown_base_changes_nothing() {
+    let w = World::new();
+    let out = w.gt_err(&["create", "x", "--base", "nope", "-m", "x"]);
+    assert!(out.stderr.contains("no local branch or tracked PR matches nope"), "{out:?}");
+    assert_eq!(w.current(), "main");
+    assert_eq!(w.head("x"), None);
+}
+
+#[test]
 fn modify_amends_and_restacks_everything_above() {
     let w = World::new();
     w.create("feat-a", "a.txt", "a\n");

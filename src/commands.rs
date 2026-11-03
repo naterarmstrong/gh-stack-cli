@@ -770,9 +770,12 @@ fn slug(msg: &str) -> String {
     s.trim_end_matches('_').to_string()
 }
 
-pub fn create(name: Option<String>, message: Option<String>, all: bool) -> Result<()> {
+pub fn create(name: Option<String>, message: Option<String>, all: bool, base: Option<String>) -> Result<()> {
     let mut ctx = Ctx::new(true)?;
-    let cur = ctx.current()?.to_string();
+    let cur = match &base {
+        Some(b) => resolve_branch(&ctx, b)?,
+        None => ctx.current()?.to_string(),
+    };
     let name = match (name, &message) {
         (Some(n), _) => n,
         (None, Some(m)) if !slug(m).is_empty() => slug(m),
@@ -782,7 +785,7 @@ pub fn create(name: Option<String>, message: Option<String>, all: bool) -> Resul
         bail!("branch {name} already exists");
     }
 
-    // Where the new branch goes: right above the current branch.
+    // Where the new branch goes: right above the base (the current branch by default).
     let (si, insert_at) = match ctx.store.file.find(&cur) {
         Some(si) => (si, ctx.store.file.stacks[si].index_of(&cur).unwrap() + 1),
         None => {
@@ -805,7 +808,7 @@ pub fn create(name: Option<String>, message: Option<String>, all: bool) -> Resul
     if all {
         git::run(&["add", "-A"])?;
     }
-    git::run(&["checkout", "--quiet", "-b", &name])?;
+    git::run(&["checkout", "--quiet", "-b", &name, &cur])?;
     if git::has_staged_changes()? {
         let ok = match &message {
             Some(m) => git::run_interactive(None, &["commit", "--quiet", "-m", m])?,
