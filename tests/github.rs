@@ -264,6 +264,107 @@ fn sync_skips_a_conflicting_branch_and_marks_it() {
     assert_eq!(w.parent("feat-b"), w.head("feat-a").unwrap());
 }
 
+/// feat-a ← feat-b ← feat-c ← feat-d, unsubmitted, with feat-c skipped by sync on a conflict.
+fn stack_with_a_marked_branch() -> World {
+    let w = World::with_github();
+    w.create("feat-a", "a.rs", "a\n");
+    w.create("feat-b", "b.rs", "b\n");
+    w.create("feat-c", "c.rs", "c\n");
+    w.create("feat-d", "d.rs", "d\n");
+    w.advance_main("c.rs", "conflicting\n");
+    w.gt_ok(&["sync"]);
+    assert!(w.config("branch.feat-c.gtNeedsRebase").is_some());
+    w
+}
+
+#[test]
+fn submit_skip_conflicts_stops_below_a_marked_branch() {
+    let w = stack_with_a_marked_branch();
+    let (c, d) = (w.head("feat-c"), w.head("feat-d"));
+    w.gt_ok(&["bottom"]);
+
+    let out = w.gt_ok(&["submit", "--skip-conflicts"]);
+    assert!(out.stderr.contains("stopped at feat-c"), "{out:?}");
+    assert_eq!(w.gh().prs().len(), 2);
+    assert_eq!(w.gh().pr_for("feat-b").base, "feat-a");
+    assert_eq!(w.remote_head("feat-b"), w.head("feat-b"));
+    assert_eq!((w.remote_head("feat-c"), w.remote_head("feat-d")), (None, None));
+    assert_eq!((w.head("feat-c"), w.head("feat-d")), (c, d), "left where they were");
+    assert_eq!(w.current(), "feat-a");
+    assert!(!w.common_dir().join("rebase-merge").exists());
+    let ls = w.gt_ok(&["ls"]);
+    assert!(line_of(&ls.stdout, "feat-c").contains("needs rebase"), "{ls:?}");
+}
+
+#[test]
+fn submit_skip_conflicts_works_from_above_the_marked_branch() {
+    let w = stack_with_a_marked_branch();
+    assert_eq!(w.current(), "feat-d");
+    w.gt_ok(&["submit", "--skip-conflicts"]);
+    assert_eq!(w.gh().prs().len(), 2);
+    assert_eq!(w.remote_head("feat-d"), None);
+}
+
+#[test]
+fn submit_skip_conflicts_leaves_shared_branches_above_alone() {
+    let w = World::with_github();
+    w.create("feat-a", "a.rs", "a\n");
+    w.create("feat-b", "b.rs", "b\n");
+    w.create("feat-c", "c.rs", "c\n");
+    w.gt_ok(&["submit"]);
+    let c = w.remote_head("feat-c");
+    w.advance_main("c.rs", "conflicting\n");
+    w.gt_ok(&["sync"]);
+
+    w.gt_ok(&["submit", "--skip-conflicts"]);
+    assert_eq!(w.remote_head("feat-a"), w.head("feat-a"));
+    assert_eq!(w.remote_head("feat-b"), w.head("feat-b"));
+    assert_eq!(w.remote_head("feat-c"), c);
+}
+
+#[test]
+fn submit_skip_conflicts_stops_at_a_new_conflict_and_marks_it() {
+    let w = World::with_github();
+    w.create("feat-a", "shared.rs", "one\n");
+    w.create("feat-b", "shared.rs", "two\n");
+    w.git(&["checkout", "--quiet", "feat-a"]);
+    w.write("shared.rs", "uno\n");
+    w.git(&["commit", "--quiet", "-a", "--amend", "--no-edit"]);
+    let b = w.head("feat-b").unwrap();
+
+    w.gt_ok(&["submit", "--skip-conflicts"]);
+    assert_eq!(w.remote_head("feat-a"), w.head("feat-a"));
+    assert_eq!(w.remote_head("feat-b"), None);
+    assert_eq!(w.config("branch.feat-b.gtNeedsRebase").as_deref(), Some(b.as_str()));
+    assert!(!w.common_dir().join("rebase-merge").exists());
+}
+
+#[test]
+fn submit_skip_conflicts_refuses_when_the_bottom_needs_a_rebase() {
+    let w = World::with_github();
+    w.create("feat-a", "a.rs", "a\n");
+    w.create("feat-b", "b.rs", "b\n");
+    w.advance_main("a.rs", "conflicting\n");
+    w.gt_ok(&["sync"]);
+
+    let out = w.gt_err(&["submit", "--skip-conflicts"]);
+    assert!(out.stderr.contains("nothing to submit: feat-a needs a rebase"), "{out:?}");
+    assert!(w.gh().prs().is_empty());
+}
+
+#[test]
+fn submit_skip_conflicts_submits_the_whole_stack_when_nothing_conflicts() {
+    let w = World::with_github();
+    w.create("feat-a", "a.rs", "a\n");
+    w.create("feat-b", "b.rs", "b\n");
+    w.gt_ok(&["bottom"]);
+
+    let out = w.gt_ok(&["submit", "--skip-conflicts"]);
+    assert_eq!(w.gh().prs().len(), 2);
+    assert!(!out.stderr.contains("stopped at"), "{out:?}");
+    assert!(!out.stderr.contains("stay local"), "{out:?}");
+}
+
 #[test]
 fn sync_offline_never_calls_github() {
     let w = submitted();

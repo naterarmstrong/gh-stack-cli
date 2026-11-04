@@ -1773,22 +1773,37 @@ pub fn clear_merged(force: bool, diverged: bool) -> Result<()> {
 
 // ───────────────────────────── submit ─────────────────────────────
 
-pub fn submit(draft: bool, no_verify: bool, relink: bool) -> Result<()> {
+pub fn submit(draft: bool, no_verify: bool, relink: bool, skip_conflicts: bool) -> Result<()> {
     let mut ctx = Ctx::new(true)?;
     let si = ctx.current_stack()?;
     // Submitting shares the current branch and everything below it with gh-stack;
-    // local branches above it stay local.
+    // local branches above it stay local. With `skip_conflicts` it's instead every
+    // branch below the nearest one needing a rebase, wherever you are in the stack,
+    // and nothing from that branch up is touched, shared or not.
+    let stop = if skip_conflicts { Some(restack::run_below_conflict(&mut ctx, si)?) } else { None };
+    if let Some(i) = stop {
+        let stack = &ctx.store.file.stacks[si];
+        if let Some(b) = stack.branches.get(i).filter(|_| stack.branches[..i].iter().all(|b| b.merged())) {
+            bail!(
+                "nothing to submit: {0} needs a rebase. To resolve it: `gt checkout {0} && gt restack --trunk`.",
+                b.branch
+            );
+        }
+    }
     let idx = ctx.store.file.stacks[si].index_of(ctx.current()?).unwrap();
-    for b in &mut ctx.store.file.stacks[si].branches[..=idx] {
+    for b in &mut ctx.store.file.stacks[si].branches[..stop.unwrap_or(idx + 1)] {
         b.local = false;
     }
-    if !restack::run(&mut ctx, si, false)? {
+    if stop.is_none() && !restack::run(&mut ctx, si, false)? {
         ctx.save()?;
         std::process::exit(1);
     }
+    let in_scope = |i: usize| stop.is_none_or(|s| i < s);
 
     let (repo_id, prs) = fetch_prs(&ctx, &[si], false)?;
-    let to_push = needs_push(&ctx, si);
+    let stack = &ctx.store.file.stacks[si];
+    let to_push: Vec<String> =
+        needs_push(&ctx, si).into_iter().filter(|b| stack.index_of(b).is_some_and(in_scope)).collect();
     let moved = moved_since_sync(&ctx, &to_push)?;
     if !moved.is_empty() {
         bail!(
@@ -1804,7 +1819,7 @@ pub fn submit(draft: bool, no_verify: bool, relink: bool) -> Result<()> {
     let stack = ctx.store.file.stacks[si].clone();
     let mut batch = MutationBatch::default();
     let mut created = vec![];
-    for (idx, b) in stack.shared() {
+    for (idx, b) in stack.shared().filter(|(idx, _)| in_scope(*idx)) {
         let parent = stack.parent_of(idx);
         match prs.get(&b.branch).filter(|p| p.state == "OPEN") {
             Some(pr) if pr.base_ref_name != parent => {
@@ -1857,6 +1872,13 @@ pub fn submit(draft: bool, no_verify: bool, relink: bool) -> Result<()> {
         if let Some(n) = b.pr_number() {
             println!("{:<40} {}", b.branch, gh.pr_url(n));
         }
+    }
+    if let Some(b) = stop.and_then(|i| stack.branches.get(i)) {
+        ui::warn(&format!(
+            "stopped at {}: it needs a rebase, so it and the branches above it weren't submitted",
+            ui::bold(&b.branch)
+        ));
+        return Ok(());
     }
     let above: Vec<String> = stack.active().filter(|(_, b)| b.local).map(|(_, b)| ui::bold(&b.branch)).collect();
     if !above.is_empty() {

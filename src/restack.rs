@@ -36,6 +36,11 @@ pub struct Plan {
 /// conflicting branch is left where it is and the branches above it are
 /// replayed onto it instead.
 pub fn plan(ctx: &Ctx, si: usize, onto_trunk: bool, skip_conflicts: bool) -> Result<Plan> {
+    plan_below(ctx, si, onto_trunk, skip_conflicts, ctx.store.file.stacks[si].branches.len())
+}
+
+/// `plan`, for only the branches of stack `si` below index `end`.
+fn plan_below(ctx: &Ctx, si: usize, onto_trunk: bool, skip_conflicts: bool, end: usize) -> Result<Plan> {
     let stack = &ctx.store.file.stacks[si];
     let mut parent: Option<(String, String)> =
         if onto_trunk { Some((stack.trunk.branch.clone(), ctx.trunk_tip(&stack.trunk.branch)?)) } else { None };
@@ -45,7 +50,7 @@ pub fn plan(ctx: &Ctx, si: usize, onto_trunk: bool, skip_conflicts: bool) -> Res
     let mut clean = vec![];
     let mut below = below_seed(ctx, stack);
 
-    for b in stack.branches.iter() {
+    for b in stack.branches[..end].iter() {
         if b.merged() {
             below.push(b.head.clone());
             continue;
@@ -234,6 +239,22 @@ pub fn run_skipping(ctx: &mut Ctx, si: usize, onto_trunk: bool) -> Result<Vec<St
         ));
     }
     Ok(plan.conflicts.into_iter().map(|c| c.branch).collect())
+}
+
+/// Restacks the branches below the nearest one that needs a rebase or would
+/// conflict, marking it if it wasn't already. That branch and everything above
+/// it stay where they are. Returns its index, or the stack's length if there's none.
+pub fn run_below_conflict(ctx: &mut Ctx, si: usize) -> Result<usize> {
+    let stack = &ctx.store.file.stacks[si];
+    let marked = stack.active().find(|(_, b)| ctx.needs_rebase(&b.branch)).map_or(stack.branches.len(), |(i, _)| i);
+    let plan = plan_below(ctx, si, false, false, marked)?;
+    let stop = plan.conflicts.first().and_then(|c| stack.index_of(&c.branch)).unwrap_or(marked);
+    apply(ctx, &plan.updates)?;
+    clear_marks(ctx, &plan.clean);
+    if let Some(c) = plan.conflicts.first() {
+        ctx.mark_needs_rebase(&c.branch)?;
+    }
+    Ok(stop)
 }
 
 fn clear_marks(ctx: &mut Ctx, branches: &[String]) {

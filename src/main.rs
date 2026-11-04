@@ -119,6 +119,9 @@ enum Cmd {
         /// Replace the GitHub stack if it doesn't match the local order
         #[arg(long)]
         relink: bool,
+        /// Submit every branch below the nearest one needing a rebase, from anywhere in the stack
+        #[arg(long)]
+        skip_conflicts: bool,
     },
     /// Pull down a stack from GitHub by PR number, URL, or branch
     Get { target: String },
@@ -242,7 +245,9 @@ fn main() {
         Cmd::Sync { all, no_prune, prefer_remote, offline } => {
             commands::sync(commands::SyncOpts { all, no_prune, prefer_remote, offline })
         }
-        Cmd::Submit { draft, no_verify, relink } => commands::submit(draft, no_verify, relink),
+        Cmd::Submit { draft, no_verify, relink, skip_conflicts } => {
+            commands::submit(draft, no_verify, relink, skip_conflicts)
+        }
         Cmd::Get { target } => commands::get(target),
         Cmd::Track { branches, trunk } => commands::track(branches, trunk),
         Cmd::Delete { target, force } => commands::delete_upstack(target, force),
