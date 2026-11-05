@@ -262,10 +262,19 @@ impl Client {
     /// Open PRs in this repo where you're asked to review by name; requests
     /// made to a team you're on (e.g. litellm-engineering) don't count.
     pub fn review_requests(&self) -> Result<Vec<ReviewPr>> {
-        let search = format!(
-            "repo:{}/{} is:pr is:open archived:false user-review-requested:@me sort:updated-desc",
-            self.owner, self.repo
-        );
+        self.search_prs("user-review-requested:@me")
+    }
+
+    /// Open PRs in this repo that you authored, including ones a cloud agent
+    /// opened under your account.
+    pub fn authored_prs(&self) -> Result<Vec<ReviewPr>> {
+        self.search_prs("author:@me")
+    }
+
+    /// The 100 most recently updated open PRs in this repo matching `filter`.
+    fn search_prs(&self, filter: &str) -> Result<Vec<ReviewPr>> {
+        let search =
+            format!("repo:{}/{} is:pr is:open archived:false {filter} sort:updated-desc", self.owner, self.repo);
         let q = format!(
             "query {{ search(query: {}, type: ISSUE, first: 100) {{ nodes {{ ... on PullRequest {{ {REVIEW_FIELDS} }} }} }} }}",
             json!(search)

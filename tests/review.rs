@@ -1,4 +1,4 @@
-//! `gt review`: pulling down others' PRs read-only, and how sync and ls treat them.
+//! `gt review` and `gt cloud`: pulling down PRs read-only, and how sync and ls treat them.
 
 mod common;
 
@@ -175,4 +175,94 @@ fn review_without_a_target_lists_requests() {
     // There is one now, and picking needs a terminal.
     let out = w.gt_err(&["review"]);
     assert!(out.stderr.contains("terminal"), "{out:?}");
+}
+
+#[test]
+fn cloud_lists_your_prs_with_no_local_branch() {
+    let w = World::with_github();
+    let none = "All your open PRs already have local branches";
+
+    // Someone else's PR isn't listed, even if it asks for your review.
+    let theirs = their_pr(&w, "theirs", "main", "t.rs");
+    w.gh().update(theirs, |p| p.review_requested = true);
+    let out = w.gt_ok(&["cloud"]);
+    assert!(out.stdout.contains(none), "{out:?}");
+
+    // Nor is one of yours that you already have locally.
+    w.create("mine", "m.rs", "m\n");
+    w.gt_ok(&["submit"]);
+    let mine = w.gh().pr_for("mine").number;
+    w.gh().update(mine, |p| p.author = "me".into());
+    let out = w.gt_ok(&["cloud"]);
+    assert!(out.stdout.contains(none), "{out:?}");
+
+    // One you don't is, and picking needs a terminal.
+    let agents = their_pr(&w, "agents", "main", "a.rs");
+    w.gh().update(agents, |p| p.author = "me".into());
+    let out = w.gt_err(&["cloud"]);
+    assert!(out.stderr.contains("terminal"), "{out:?}");
+
+    // Once pulled down, it has a local branch too.
+    w.gt_ok(&["cloud", &agents.to_string()]);
+    let out = w.gt_ok(&["cloud"]);
+    assert!(out.stdout.contains(none), "{out:?}");
+}
+
+#[test]
+fn cloud_checks_a_fork_pr_against_its_pr_branch() {
+    let w = World::with_github();
+    // Its head shares a name with your local main, but it'd land on pr/1.
+    let n = w.gh().add_pr(FakePr::new("main", "main"));
+    w.gh().update(n, |p| {
+        p.author = "me".into();
+        p.cross_repo = true;
+    });
+    let out = w.gt_err(&["cloud"]);
+    assert!(out.stderr.contains("terminal"), "{out:?}");
+}
+
+#[test]
+fn cloud_pulls_down_drafts_on_both_sides_of_a_pr() {
+    let w = World::with_github();
+    let r1 = their_pr(&w, "r1", "main", "r1.rs");
+    let r2 = their_pr(&w, "r2", "r1", "r2.rs");
+    let r3 = their_pr(&w, "r3", "r2", "r3.rs");
+    let r4 = their_pr(&w, "r4", "r3", "r4.rs");
+    let r5 = their_pr(&w, "r5", "r4", "r5.rs");
+    for n in [r2, r4] {
+        w.gh().update(n, |p| p.draft = true);
+    }
+
+    let out = w.gt_ok(&["cloud", &r3.to_string()]);
+    for n in [r1, r2, r4, r5] {
+        assert!(out.stderr.contains(&format!("also pulling down #{n}")), "{out:?}");
+    }
+    assert_eq!(w.current(), "r3");
+    for b in ["r1", "r2", "r3", "r4", "r5"] {
+        assert!(w.head(b).is_some(), "{b} pulled down");
+        assert!(w.config(&format!("branch.{b}.gtReview")).is_some());
+    }
+}
+
+#[test]
+fn cloud_leaves_the_same_state_as_review_and_syncs_agent_pushes() {
+    let w = World::with_github();
+    let n = their_pr(&w, "agent-work", "main", "a.rs");
+    w.gh().update(n, |p| p.author = "me".into());
+
+    w.gt_ok(&["cloud", &n.to_string()]);
+    assert_eq!(w.current(), "agent-work");
+    assert_eq!(w.config("branch.agent-work.gtReview").as_deref(), Some("1"));
+    assert_eq!(w.config("branch.agent-work.gtReviewBase").as_deref(), Some("main"));
+    assert_eq!(w.config("branch.agent-work.github-pr-owner-number").as_deref(), Some("acme#widgets#1"));
+    assert!(!w.state_path().exists() || w.stacks().is_empty(), "cloud branches aren't stacked");
+    assert!(w.gt_ok(&["ls"]).stdout.contains("Reviewing"));
+
+    let pushed = w.teammate_push("agent-work", "a.rs", "rewritten\n", true);
+    w.gt_ok(&["sync"]);
+    assert_eq!(w.head("agent-work").as_deref(), Some(pushed.as_str()));
+
+    w.merge_pr(n);
+    w.gt_ok(&["sync"]);
+    assert_eq!(w.head("agent-work"), None);
 }

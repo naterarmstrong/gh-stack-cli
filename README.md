@@ -138,6 +138,15 @@ When the PR is stacked, `gt review` also pulls down and marks the rest of its st
 
 The Reviewing section of `gt log` and `gt ls` draws each reviewed stack on its own, top first, above the branch it sits on, with standalone PRs listed after the stacks. `gt review` records each PR's base in `branch.<name>.gtReviewBase` so `gt ls` can do this offline, and `gt log` refreshes it whenever GitHub reports a different base.
 
+### Following your cloud agents' PRs
+
+```sh
+gt cloud             # pick from your open PRs that have no local branch, stacks grouped first
+gt cloud 1234        # or by PR number, URL or branch name
+```
+
+`gt cloud` is `gt review` for PRs you authored that a cloud agent opened and keeps updating. It leaves the same state: a read-only review branch in the Reviewing section of `gt log` and `gt ls`, which `gt sync` moves to the PR head and deletes once the PR merges. Two things differ. The list is your own PRs, and a PR drops off it once it has a local branch, so it won't reappear after you've pulled it down. And the walks through the PR's stack don't stop at drafts, since agents often leave their work in draft.
+
 ## How `gt loc` classifies files
 
 Each changed file is counted as one of:

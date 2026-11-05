@@ -2124,30 +2124,62 @@ pub fn review(target: Option<String>) -> Result<()> {
                 println!("No open PRs are waiting on your review.");
                 return Ok(());
             }
-            let items = review_items(&prs, &ctx.default_trunk());
-            let picked = picker::pick("Review", &items, None)?.ok_or_else(|| anyhow!("cancelled"))?;
-            let n: u64 = picked.split('\t').next().unwrap().parse()?;
-            let pr = prs.into_iter().find(|p| p.number == n).unwrap();
-            let head = pr.head_ref_name.clone();
-            (Some(pr), head)
+            pick_review(&ctx, "Review", prs)?
         }
-        Some(t) => {
-            let query = match parse_pr(&t) {
-                Some(n) => PrQuery::Number(n),
-                None => PrQuery::Head(t.clone()),
-            };
-            match ctx.gh()?.review_pr(&query)? {
-                Some(pr) => {
-                    let head = pr.head_ref_name.clone();
-                    (Some(pr), head)
-                }
-                None if parse_pr(&t).is_some() => bail!("PR {t} not found"),
-                // A branch with no PR can still be pulled down frozen.
-                None => (None, t),
-            }
-        }
+        Some(t) => find_review(&ctx, t)?,
     };
+    pull_down(&mut ctx, pr, head, false)
+}
 
+/// `gt review` for your own PRs that cloud agents work on: the same read-only
+/// review branch, picked from those you don't have locally yet. Agents leave
+/// work in draft, so drafts in the stack come down too.
+pub fn cloud(target: Option<String>) -> Result<()> {
+    let mut ctx = Ctx::new(false)?;
+    let (pr, head) = match target {
+        None => {
+            let mut prs = ctx.gh()?.authored_prs()?;
+            prs.retain(|p| ctx.refs.head(&review_branch(p)).is_none());
+            if prs.is_empty() {
+                println!("All your open PRs already have local branches.");
+                return Ok(());
+            }
+            pick_review(&ctx, "Cloud PR", prs)?
+        }
+        Some(t) => find_review(&ctx, t)?,
+    };
+    pull_down(&mut ctx, pr, head, true)
+}
+
+/// Asks which of `prs` to pull down.
+fn pick_review(ctx: &Ctx, prompt: &str, prs: Vec<ReviewPr>) -> Result<(Option<ReviewPr>, String)> {
+    let items = review_items(&prs, &ctx.default_trunk());
+    let picked = picker::pick(prompt, &items, None)?.ok_or_else(|| anyhow!("cancelled"))?;
+    let n: u64 = picked.split('\t').next().unwrap().parse()?;
+    let pr = prs.into_iter().find(|p| p.number == n).unwrap();
+    let head = pr.head_ref_name.clone();
+    Ok((Some(pr), head))
+}
+
+/// Resolves a branch name, PR number or PR URL to its PR and head branch.
+fn find_review(ctx: &Ctx, target: String) -> Result<(Option<ReviewPr>, String)> {
+    let query = match parse_pr(&target) {
+        Some(n) => PrQuery::Number(n),
+        None => PrQuery::Head(target.clone()),
+    };
+    match ctx.gh()?.review_pr(&query)? {
+        Some(pr) => {
+            let head = pr.head_ref_name.clone();
+            Ok((Some(pr), head))
+        }
+        None if parse_pr(&target).is_some() => bail!("PR {target} not found"),
+        // A branch with no PR can still be pulled down frozen.
+        None => Ok((None, target)),
+    }
+}
+
+/// Pulls down a PR and the rest of its stack, then checks it out.
+fn pull_down(ctx: &mut Ctx, pr: Option<ReviewPr>, head: String, drafts: bool) -> Result<()> {
     if let Some(p) = &pr {
         let author = p.author.as_ref().map(|a| format!(" by {}", a.login)).unwrap_or_default();
         ui::info(&format!("#{} {}{author}", p.number, ui::bold(&p.title)));
@@ -2155,22 +2187,22 @@ pub fn review(target: Option<String>) -> Result<()> {
             ui::warn(&format!("#{} is {}", p.number, p.state.to_lowercase()));
         }
     }
-    let name = pull_review(&mut ctx, pr.as_ref(), &head)?;
+    let name = pull_review(ctx, pr.as_ref(), &head)?;
     if let Some(p) = &pr {
-        review_stack(&mut ctx, p)?;
+        review_stack(ctx, p, drafts)?;
     }
     if let Some(wt) = ctx.other_worktree(&name) {
         ui::info(&format!("{name} is checked out in {}", wt.display()));
         return Ok(());
     }
-    checkout(&ctx, &name)
+    checkout(ctx, &name)
 }
 
 /// Pulls down the rest of a stacked PR's stack so it can be reviewed whole:
 /// the PRs it sits on, nearest parent first, then every PR stacked above it.
-/// Each walk stops at trunk or at a PR `stack_skip` rejects, so a draft cuts
-/// off whatever is beyond it.
-fn review_stack(ctx: &mut Ctx, pr: &ReviewPr) -> Result<()> {
+/// Each walk stops at trunk or at a PR `pull_stacked` rejects, so a draft cuts
+/// off whatever is beyond it unless `drafts` lets the walks through them.
+fn review_stack(ctx: &mut Ctx, pr: &ReviewPr, drafts: bool) -> Result<()> {
     let trunk = ctx.default_trunk();
     let mut seen = HashSet::from([pr.head_ref_name.clone()]);
     let mut base = pr.base_ref_name.clone();
@@ -2178,7 +2210,7 @@ fn review_stack(ctx: &mut Ctx, pr: &ReviewPr) -> Result<()> {
         let Some(p) = ctx.gh()?.review_pr(&PrQuery::Head(base.clone()))? else {
             break;
         };
-        if !pull_stacked(ctx, &p)? {
+        if !pull_stacked(ctx, &p, drafts)? {
             break;
         }
         base = p.base_ref_name.clone();
@@ -2186,7 +2218,7 @@ fn review_stack(ctx: &mut Ctx, pr: &ReviewPr) -> Result<()> {
     let mut todo = vec![pr.head_ref_name.clone()];
     while let Some(head) = todo.pop() {
         for p in ctx.gh()?.review_prs_on(&head)? {
-            if seen.insert(p.head_ref_name.clone()) && pull_stacked(ctx, &p)? {
+            if seen.insert(p.head_ref_name.clone()) && pull_stacked(ctx, &p, drafts)? {
                 todo.push(p.head_ref_name.clone());
             }
         }
@@ -2196,10 +2228,10 @@ fn review_stack(ctx: &mut Ctx, pr: &ReviewPr) -> Result<()> {
 
 /// Pulls down one PR from the reviewed PR's stack, or says why it won't.
 /// Returns whether it did, i.e. whether to keep walking past it.
-fn pull_stacked(ctx: &mut Ctx, p: &ReviewPr) -> Result<bool> {
+fn pull_stacked(ctx: &mut Ctx, p: &ReviewPr, drafts: bool) -> Result<bool> {
     let why = if p.state != "OPEN" {
         Some(format!("is {}", p.state.to_lowercase()))
-    } else if p.is_draft {
+    } else if p.is_draft && !drafts {
         Some("is a draft".to_string())
     } else if p.is_cross_repository {
         Some("is from a fork".to_string())
@@ -2219,15 +2251,17 @@ fn pull_stacked(ctx: &mut Ctx, p: &ReviewPr) -> Result<bool> {
     Ok(true)
 }
 
+/// The local branch a PR is pulled down to. Branches from forks don't exist on
+/// our remote, so they're named after the PR.
+fn review_branch(p: &ReviewPr) -> String {
+    if p.is_cross_repository { format!("pr/{}", p.number) } else { p.head_ref_name.clone() }
+}
+
 /// Fetches a PR's head into a local branch, marks it as a review branch and
 /// ties it to its PR. Returns the local branch name.
 fn pull_review(ctx: &mut Ctx, pr: Option<&ReviewPr>, head: &str) -> Result<String> {
-    // Branches from forks don't exist on our remote; name them after the PR.
     let cross = pr.is_some_and(|p| p.is_cross_repository);
-    let name = match &pr {
-        Some(p) if cross => format!("pr/{}", p.number),
-        _ => head.to_string(),
-    };
+    let name = pr.map(review_branch).unwrap_or_else(|| head.to_string());
     if ctx.store.file.find(&name).is_some() {
         bail!("{name} is one of your stacked branches; use `gt co {name}`");
     }

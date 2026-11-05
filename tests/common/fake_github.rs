@@ -325,7 +325,8 @@ impl State {
             let nodes: Vec<Value> = self
                 .prs
                 .iter()
-                .filter(|p| p.review_requested && p.state == "OPEN")
+                .filter(|p| p.state == "OPEN")
+                .filter(|p| if query.contains("author:@me") { p.author == "me" } else { p.review_requested })
                 .rev()
                 .map(|p| self.pr_json(p))
                 .collect();

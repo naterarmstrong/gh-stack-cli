@@ -159,6 +159,13 @@ enum Cmd {
         /// Branch name, PR number, or PR URL
         target: Option<String>,
     },
+    /// Check out a PR of yours that a cloud agent keeps updating, as `gt review` does, except
+    /// that drafts in its stack come down too.
+    /// Without a target, pick from your open PRs that have no local branch.
+    Cloud {
+        /// Branch name, PR number, or PR URL
+        target: Option<String>,
+    },
     /// Lines changed by a branch's commit, per file, split into src/test/doc/gen
     Loc {
         /// Branch, PR number, or any commit (defaults to the current branch)
@@ -253,6 +260,7 @@ fn main() {
         Cmd::Delete { target, force } => commands::delete_upstack(target, force),
         Cmd::ClearMerged { force, include_diverged } => commands::clear_merged(force, include_diverged),
         Cmd::Review { target } => commands::review(target),
+        Cmd::Cloud { target } => commands::cloud(target),
         Cmd::Loc { target, json } => commands::loc_cmd(target, json),
         Cmd::Open { target } => commands::open(target),
         Cmd::History { action, branch, json } => match action {
