@@ -235,6 +235,26 @@ pub fn own_commits(tip: &str, excludes: &[String]) -> Result<Vec<String>> {
     Ok(run(&args)?.lines().map(str::to_string).collect())
 }
 
+/// `own_commits`, each with its parents.
+pub fn own_chain(tip: &str, excludes: &[String]) -> Result<Vec<(String, Vec<String>)>> {
+    let mut args = vec![
+        "rev-list".to_string(),
+        "--reverse".into(),
+        "--parents".into(),
+        "--ignore-missing".into(),
+        tip.to_string(),
+    ];
+    args.extend(excludes.iter().filter(|e| !e.is_empty()).map(|e| format!("^{e}")));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    Ok(run(&args)?
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split(' ').map(str::to_string);
+            Some((f.next()?, f.collect()))
+        })
+        .collect())
+}
+
 /// Commits only on `a` and commits only on `b`.
 pub fn ahead_behind(a: &str, b: &str) -> Option<(usize, usize)> {
     let out = run(&["rev-list", "--left-right", "--count", &format!("{a}...{b}")]).ok()?;
@@ -322,6 +342,15 @@ pub fn commit_tree(tree: &str, parent: &str, meta: &CommitMeta) -> Result<String
             ("GIT_AUTHOR_DATE", &meta.author_date),
         ],
     )?;
+    if !out.ok {
+        bail!("git commit-tree failed: {}", out.stderr.trim());
+    }
+    Ok(out.stdout.trim().to_string())
+}
+
+/// Write a commit object with `tree` on top of `parent`, authored by the user.
+pub fn commit_tree_as_user(tree: &str, parent: &str, message: &str) -> Result<String> {
+    let out = run_raw(None, &["commit-tree", tree, "-p", parent, "-F", "-"], Some(message), &[])?;
     if !out.ok {
         bail!("git commit-tree failed: {}", out.stderr.trim());
     }

@@ -4,6 +4,13 @@
 //! patch (a restack, a reset back to it) folds into the version it carries,
 //! keyed by `git patch-id`, so only real edits count as new versions.
 //!
+//! A version's patch is the branch's whole change: from its base, the parent of
+//! its oldest commit of its own, to the commit. With one commit that's just the
+//! commit's diff. A branch with several commits gets a version per commit,
+//! commits it only passed through on the way to a tip included (a fetch that
+//! brought in three commits leaves one reflog entry), and a restack, a squash
+//! or a reset back to a commit folds into the version whose change it keeps.
+//!
 //! What a version changed is an interdiff, not a tree diff: across a restack
 //! the base moved, and a tree diff would fold in everything that landed on the
 //! parent meanwhile. So the previous patch is re-applied onto this version's
@@ -144,11 +151,13 @@ impl Table {
 /// entries are dropped only once they go unused for `PRUNE_AFTER_SECS`.
 #[derive(Serialize, Deserialize, Default)]
 struct Cache {
-    /// Commit → its patch-id, or "" when it has no diff (empty, or a merge).
+    /// Patch key → its patch-id, or "" when it has no diff (empty, or a merge).
+    /// The key is the commit, for its diff against its parent, or
+    /// `<commit> <base>` for its diff against some other base.
     #[serde(default)]
     patch_ids: Table,
-    /// `<commit> <onto>` → the tree of that commit's patch re-applied onto
-    /// `onto`, or "" when the re-apply conflicts.
+    /// `<patch key> <onto>` → the tree of that patch re-applied onto `onto`,
+    /// or "" when the re-apply conflicts.
     #[serde(default)]
     rebased: Table,
     #[serde(skip)]
@@ -230,14 +239,54 @@ impl<'r> Commits<'r> {
 
 // ───────────────────────────── patch-ids ─────────────────────────────
 
-/// Patch-ids for `shas`, from the cache or else from one
-/// `git diff-tree --stdin | git patch-id` pipeline for all the missing ones.
-fn patch_ids(cache: &mut Cache, shas: &[&str]) -> Result<()> {
-    let missing: Vec<&str> =
-        shas.iter().copied().filter(|s| !cache.patch_ids.contains(s)).collect::<HashSet<_>>().into_iter().collect();
-    if missing.is_empty() {
-        return Ok(());
+/// A commit's change measured from `base`: its own diff when `base` is its
+/// parent, the branch's whole change up to it otherwise.
+#[derive(Clone)]
+struct Patch {
+    sha: String,
+    base: Option<String>,
+}
+
+impl Patch {
+    /// The cache key. A commit on its own parent keeps the bare sha, so
+    /// single-commit branches share entries with every earlier run.
+    fn key(&self, commits: &mut Commits) -> String {
+        match &self.base {
+            Some(b) if commits.parent(&self.sha).as_deref() != Some(b.as_str()) => format!("{} {b}", self.sha),
+            _ => self.sha.clone(),
+        }
     }
+}
+
+/// Patch-ids for `patches`, from the cache or else from one
+/// `git diff-tree --stdin | git patch-id` pipeline per batch of missing ones.
+fn patch_ids(cache: &mut Cache, commits: &mut Commits, patches: &[Patch]) -> Result<()> {
+    let mut missing: Vec<(String, Patch)> = vec![];
+    for p in patches {
+        let key = p.key(commits);
+        if !cache.patch_ids.contains(&key) && !missing.iter().any(|(k, _)| *k == key) {
+            missing.push((key, p.clone()));
+        }
+    }
+    // patch-id names each result by its commit, so a batch holds each commit once.
+    while !missing.is_empty() {
+        let mut batch: Vec<(String, Patch)> = vec![];
+        let mut rest = vec![];
+        for (k, p) in missing {
+            if batch.iter().any(|(_, b)| b.sha == p.sha) { rest.push((k, p)) } else { batch.push((k, p)) }
+        }
+        let ids = run_patch_ids(&batch.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>())?;
+        for (k, p) in &batch {
+            cache.patch_ids.insert(k.clone(), ids.get(&p.sha).cloned().unwrap_or_default());
+        }
+        missing = rest;
+    }
+    Ok(())
+}
+
+/// Runs patch keys through `git diff-tree --stdin | git patch-id`, keyed by
+/// commit. diff-tree reads a key's optional second sha as the commit to diff against.
+fn run_patch_ids(lines: &[&str]) -> Result<HashMap<String, String>> {
     // -U0: context lines come from the base, so with them a restack onto a
     // changed base would read as a new patch.
     let mut diff = Command::new(git::git_bin())
@@ -256,7 +305,7 @@ fn patch_ids(cache: &mut Cache, shas: &[&str]) -> Result<()> {
         .context("spawning git patch-id")?;
     // Feed diff-tree from another thread: with enough shas every pipe in the
     // chain can fill up at once.
-    let input: String = missing.iter().map(|s| format!("{s}\n")).collect();
+    let input: String = lines.iter().map(|s| format!("{s}\n")).collect();
     let mut stdin = diff.stdin.take().unwrap();
     let writer = std::thread::spawn(move || {
         let _ = stdin.write_all(input.as_bytes());
@@ -264,35 +313,32 @@ fn patch_ids(cache: &mut Cache, shas: &[&str]) -> Result<()> {
     let out = ids.wait_with_output()?;
     let _ = writer.join();
     let _ = diff.wait();
-
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if let Some((pid, sha)) = line.split_once(' ') {
-            cache.patch_ids.insert(sha.trim().to_string(), pid.to_string());
-        }
-    }
-    for s in missing {
-        if !cache.patch_ids.contains(s) {
-            cache.patch_ids.insert(s.to_string(), String::new());
-        }
-    }
-    Ok(())
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(' ').map(|(pid, sha)| (sha.trim().to_string(), pid.to_string())))
+        .collect())
 }
 
-/// The patch-id of each of `shas` that's in the repo and has a diff, sharing
-/// `gt history`'s cache. A commit missing here (pruned, or never fetched) is
-/// left out rather than cached as having no patch.
-pub fn patch_ids_of(common_dir: &Path, shas: &[&str]) -> Result<HashMap<String, String>> {
+/// The patch-id of each of `shas`' change from its base (None: its parent)
+/// that's in the repo and has a diff, sharing `gt history`'s cache. A commit
+/// missing here (pruned, or never fetched) is left out rather than cached as
+/// having no patch.
+pub fn patch_ids_of(common_dir: &Path, shas: &[(&str, Option<&str>)]) -> Result<HashMap<String, String>> {
     let repo = git::open()?;
-    let present: Vec<&str> = shas
+    let mut commits = Commits::new(&repo);
+    let present: Vec<Patch> = shas
         .iter()
-        .copied()
-        .filter(|s| gix::ObjectId::from_hex(s.as_bytes()).is_ok_and(|id| repo.has_object(id)))
+        .filter(|(s, b)| commits.exists(s) && b.is_none_or(|b| commits.exists(b)))
+        .map(|(s, b)| Patch { sha: s.to_string(), base: b.map(str::to_string) })
         .collect();
     let mut cache = Cache::load(common_dir);
-    patch_ids(&mut cache, &present)?;
+    patch_ids(&mut cache, &mut commits, &present)?;
     let ids = present
-        .into_iter()
-        .filter_map(|s| Some((s.to_string(), cache.patch_ids.get(s).filter(|p| !p.is_empty())?.to_string())))
+        .iter()
+        .filter_map(|p| {
+            let key = p.key(&mut commits);
+            Some((p.sha.clone(), cache.patch_ids.get(&key).filter(|id| !id.is_empty())?.to_string()))
+        })
         .collect();
     cache.save();
     Ok(ids)
@@ -300,37 +346,40 @@ pub fn patch_ids_of(common_dir: &Path, shas: &[&str]) -> Result<HashMap<String, 
 
 // ───────────────────────────── re-applying patches ─────────────────────────────
 
-/// The tree of `sha`'s patch re-applied onto `onto`, or None if that conflicts.
-/// A 3-way merge whose base is `sha`'s own parent: just that patch, somewhere else.
-fn rebased_tree(sha: &str, parent: &str, onto: &str) -> Result<Option<String>> {
-    Ok(match git::merge_tree(parent, onto, sha)? {
+/// The tree of a patch re-applied onto `onto`, or None if that conflicts.
+/// A 3-way merge whose base is the patch's own base: just that change, somewhere else.
+fn rebased_tree(sha: &str, base: &str, onto: &str) -> Result<Option<String>> {
+    Ok(match git::merge_tree(base, onto, sha)? {
         Merge::Clean(tree) => Some(tree),
         Merge::Conflict(_) => None,
     })
 }
 
-/// `rebased_tree` for every (sha, onto) pair, from the cache or else in
+/// `rebased_tree` for every (patch, onto) pair, from the cache or else in
 /// parallel. A cached tree that `git gc` has since pruned is recomputed.
-fn rebase_all(cache: &mut Cache, commits: &mut Commits, pairs: &[(String, String)]) -> Result<()> {
+fn rebase_all(cache: &mut Cache, commits: &mut Commits, pairs: &[(Patch, String)]) -> Result<()> {
     let mut todo = vec![];
-    for (sha, onto) in pairs {
-        let key = format!("{sha} {onto}");
+    for (patch, onto) in pairs {
+        let key = format!("{} {onto}", patch.key(commits));
         let fresh = cache.rebased.get(&key).is_some_and(|t| t.is_empty() || commits.exists(t));
         if fresh || todo.iter().any(|(k, ..): &(String, String, String, String)| *k == key) {
             continue;
         }
-        let parent = commits.parent(sha).ok_or_else(|| anyhow!("{} is a root commit", ui::short(sha)))?;
-        todo.push((key, sha.clone(), parent, onto.clone()));
+        let base = match &patch.base {
+            Some(b) => b.clone(),
+            None => commits.parent(&patch.sha).ok_or_else(|| anyhow!("{} is a root commit", ui::short(&patch.sha)))?,
+        };
+        todo.push((key, patch.sha.clone(), base, onto.clone()));
     }
-    let results = par_map(&todo, |(_, sha, parent, onto)| rebased_tree(sha, parent, onto));
+    let results = par_map(&todo, |(_, sha, base, onto)| rebased_tree(sha, base, onto));
     for ((key, ..), tree) in todo.into_iter().zip(results) {
         cache.rebased.insert(key, tree?.unwrap_or_default());
     }
     Ok(())
 }
 
-fn cached_rebase(cache: &mut Cache, sha: &str, onto: &str) -> Option<String> {
-    cache.rebased.get(&format!("{sha} {onto}")).filter(|t| !t.is_empty()).map(str::to_string)
+fn cached_rebase(cache: &mut Cache, commits: &mut Commits, patch: &Patch, onto: &str) -> Option<String> {
+    cache.rebased.get(&format!("{} {onto}", patch.key(commits))).filter(|t| !t.is_empty()).map(str::to_string)
 }
 
 /// `f` over `items` on a few threads, results in order. Each item here costs a
@@ -375,6 +424,9 @@ pub struct Move {
     pub sha: String,
     pub time: i64,
     pub action: &'static str,
+    /// The branch pointed here. A commit the branch only passed through, on its
+    /// way to a later one of its own commits, arrives with the move to that one.
+    pub tip: bool,
 }
 
 #[derive(Serialize, Default)]
@@ -409,6 +461,9 @@ pub struct Version {
     pub date: String,
     pub action: &'static str,
     pub current: bool,
+    /// The branch pointed at this patch at some point, rather than only passing
+    /// through it (see `Move::tip`).
+    pub tip: bool,
     pub remote: Remote,
     /// Every move of the branch onto this patch, oldest first, the first included.
     pub moves: Vec<Move>,
@@ -448,6 +503,47 @@ pub struct History {
     pub versions: Vec<Version>,
     #[serde(skip)]
     cache: Cache,
+    #[serde(skip)]
+    own: Own,
+}
+
+/// Which commits are the branch's own: reachable from its reflog but not from
+/// what's below it, and never on a lower branch.
+#[derive(Default)]
+struct Own {
+    reach: HashSet<String>,
+    theirs: HashSet<String>,
+}
+
+/// Longest run of a branch's own commits that `chain` walks, so a reflog entry
+/// on unrelated history can't send it down all of that history.
+const MAX_CHAIN: usize = 500;
+
+impl Own {
+    /// `sha` and the branch's own commits under it, oldest first, by first
+    /// parent, and the commit they sit on (None for a root).
+    fn chain(&self, commits: &mut Commits, sha: &str) -> (Vec<String>, Option<String>) {
+        let mut chain = vec![sha.to_string()];
+        let mut base = commits.parent(sha);
+        while let Some(p) = base.clone() {
+            if !self.reach.contains(&p) || self.theirs.contains(&p) || chain.len() >= MAX_CHAIN {
+                break;
+            }
+            base = commits.parent(&p);
+            chain.push(p);
+        }
+        chain.reverse();
+        (chain, base)
+    }
+
+    /// The commit `sha`'s branch change is measured from.
+    fn base(&self, commits: &mut Commits, sha: &str) -> Option<String> {
+        self.chain(commits, sha).1
+    }
+
+    fn patch(&self, commits: &mut Commits, sha: &str) -> Patch {
+        Patch { sha: sha.to_string(), base: self.base(commits, sha) }
+    }
 }
 
 /// Builds `branch`'s version history. `with_deltas` also sizes what each version changed.
@@ -479,73 +575,97 @@ pub fn load(common_dir: &Path, remote: &str, branch: &str, at: &Placement, with_
             .filter(|s| !theirs.contains(*s) && commits.exists(s) && seen.insert(*s))
             .collect()
     };
-    let own = not_below(&candidates, &at.below.iter().filter(|s| commits.exists(s)).collect::<Vec<_>>())?;
-    let entries: Vec<&Entry> = entries.iter().filter(|e| own.contains(&e.sha)).collect();
+    let reach = not_below(&candidates, &at.below.iter().filter(|s| commits.exists(s)).collect::<Vec<_>>())?;
+    let entries: Vec<&Entry> = entries.iter().filter(|e| reach.contains(&e.sha) && !theirs.contains(&e.sha)).collect();
     if entries.is_empty() {
         bail!("{branch} has no commit of its own in its reflog");
     }
-    patch_ids(&mut cache, &entries.iter().map(|e| e.sha.as_str()).collect::<Vec<_>>())?;
+    let own = Own { reach, theirs };
+
+    // Each entry brings the commits under it that the branch had not been on.
+    let chains: Vec<(Vec<String>, Option<String>)> = entries.iter().map(|e| own.chain(&mut commits, &e.sha)).collect();
+    let patches: Vec<Patch> = chains
+        .iter()
+        .flat_map(|(chain, base)| chain.iter().map(|sha| Patch { sha: sha.clone(), base: base.clone() }))
+        .collect();
+    patch_ids(&mut cache, &mut commits, &patches)?;
 
     let mut versions: Vec<Version> = vec![];
     let mut by_patch: HashMap<String, usize> = HashMap::new();
+    let mut by_sha: HashMap<String, usize> = HashMap::new();
     let mut last: Option<usize> = None;
-    for e in entries {
-        let key = match cache.patch_ids.get(&e.sha).filter(|p| !p.is_empty()) {
-            Some(pid) => pid.to_string(),
-            None => format!("tree:{}", commits.get(&e.sha).map(|i| i.tree.as_str()).unwrap_or(&e.sha)),
-        };
-        let mv = Move { sha: e.sha.clone(), time: e.time.seconds, action: action(&e.message) };
-        let i = match by_patch.get(&key) {
-            Some(&i) => {
-                let v = &mut versions[i];
-                if v.sha != e.sha || last != Some(i) {
-                    v.sha = e.sha.clone();
-                    // A message-only amend keeps the patch; show the latest message.
-                    v.subject = commits.get(&e.sha).map(|c| c.subject.clone()).unwrap_or_default();
-                    v.moves.push(mv);
+    for (e, (chain, base)) in entries.into_iter().zip(chains) {
+        for (k, sha) in chain.iter().enumerate() {
+            let is_tip = k + 1 == chain.len();
+            if !is_tip && let Some(&i) = by_sha.get(sha) {
+                // Already listed; what comes next is measured against it.
+                last = Some(i);
+                continue;
+            }
+            let key = Patch { sha: sha.clone(), base: base.clone() }.key(&mut commits);
+            let key = match cache.patch_ids.get(&key).filter(|p| !p.is_empty()) {
+                Some(pid) => pid.to_string(),
+                None => format!("tree:{}", commits.get(sha).map(|i| i.tree.as_str()).unwrap_or(sha)),
+            };
+            let mv = Move { sha: sha.clone(), time: e.time.seconds, action: action(&e.message), tip: is_tip };
+            let i = match by_patch.get(&key) {
+                Some(&i) => {
+                    let v = &mut versions[i];
+                    if v.sha != *sha || last != Some(i) {
+                        v.sha = sha.clone();
+                        // A message-only amend keeps the patch; show the latest message.
+                        v.subject = commits.get(sha).map(|c| c.subject.clone()).unwrap_or_default();
+                        v.moves.push(mv);
+                    }
+                    i
                 }
-                i
-            }
-            None => {
-                let i = versions.len();
-                versions.push(Version {
-                    version: i + 1,
-                    sha: e.sha.clone(),
-                    subject: commits.get(&e.sha).map(|c| c.subject.clone()).unwrap_or_default(),
-                    time: e.time.seconds,
-                    date: e.time.format_or_unix(gix::date::time::format::ISO8601_STRICT),
-                    action: mv.action,
-                    current: false,
-                    remote: Remote::default(),
-                    moves: vec![mv],
-                    delta: None,
-                    from: last.map(|l| (l, versions[l].sha.clone())),
-                });
-                by_patch.insert(key, i);
-                i
-            }
-        };
-        last = Some(i);
+                None => {
+                    let i = versions.len();
+                    versions.push(Version {
+                        version: i + 1,
+                        sha: sha.clone(),
+                        subject: commits.get(sha).map(|c| c.subject.clone()).unwrap_or_default(),
+                        time: e.time.seconds,
+                        date: e.time.format_or_unix(gix::date::time::format::ISO8601_STRICT),
+                        action: mv.action,
+                        current: false,
+                        tip: false,
+                        remote: Remote::default(),
+                        moves: vec![mv],
+                        delta: None,
+                        from: last.map(|l| (l, versions[l].sha.clone())),
+                    });
+                    by_patch.insert(key, i);
+                    i
+                }
+            };
+            by_sha.insert(sha.clone(), i);
+            last = Some(i);
+        }
     }
 
     let remote_ref = format!("refs/remotes/{remote}/{branch}");
     let remote_log = reflog(&repo, &remote_ref);
     let remote_tip = repo.try_find_reference(remote_ref.as_str())?.and_then(|r| r.try_id().map(|id| id.to_string()));
+    // A push or fetch of a commit carries the branch's commits under it.
+    let mut pushed: HashSet<String> = HashSet::new();
+    let mut fetched: HashSet<String> = HashSet::new();
+    for e in &remote_log {
+        let set = if e.message.starts_with("update by push") { &mut pushed } else { &mut fetched };
+        if set.insert(e.sha.clone()) {
+            set.extend(own.chain(&mut commits, &e.sha).0);
+        }
+    }
     for v in versions.iter_mut() {
         v.current = v.sha == tip;
+        v.tip = v.moves.iter().any(|m| m.tip);
         let shas: Vec<String> = v.shas().into_iter().map(str::to_string).collect();
-        let shas: Vec<&str> = shas.iter().map(String::as_str).collect();
-        for e in remote_log.iter().filter(|e| shas.contains(&e.sha.as_str())) {
-            if e.message.starts_with("update by push") {
-                v.remote.pushed = true;
-            } else {
-                v.remote.fetched = true;
-            }
-        }
-        v.remote.tip = remote_tip.as_deref().is_some_and(|t| shas.contains(&t));
+        v.remote.pushed = shas.iter().any(|s| pushed.contains(s));
+        v.remote.fetched = shas.iter().any(|s| fetched.contains(s));
+        v.remote.tip = remote_tip.as_ref().is_some_and(|t| shas.contains(t));
     }
 
-    let mut h = History { branch: branch.to_string(), parent: at.parent.clone(), tip, versions, cache };
+    let mut h = History { branch: branch.to_string(), parent: at.parent.clone(), tip, versions, cache, own };
     if with_deltas {
         attach_deltas(&mut h, common_dir, &mut commits)?;
     }
@@ -553,7 +673,7 @@ pub fn load(common_dir: &Path, remote: &str, branch: &str, at: &Placement, with_
     Ok(h)
 }
 
-/// Which of `shas` are not reachable from any of `below`, in one `git rev-list`.
+/// Every commit reachable from `shas` but from none of `below`, in one `git rev-list`.
 fn not_below(shas: &[&str], below: &[&String]) -> Result<HashSet<String>> {
     if shas.is_empty() {
         return Ok(HashSet::new());
@@ -563,8 +683,7 @@ fn not_below(shas: &[&str], below: &[&String]) -> Result<HashSet<String>> {
     if !out.ok {
         bail!("git rev-list failed: {}", out.stderr.trim());
     }
-    let reachable: HashSet<&str> = out.stdout.lines().collect();
-    Ok(shas.iter().filter(|s| reachable.contains(*s)).map(|s| s.to_string()).collect())
+    Ok(out.stdout.lines().map(str::to_string).collect())
 }
 
 /// Sizes each version's change against the version the branch was on just
@@ -574,27 +693,27 @@ fn not_below(shas: &[&str], below: &[&String]) -> Result<HashSet<String>> {
 /// cacheable as the reflog grows.
 fn attach_deltas(h: &mut History, common_dir: &Path, commits: &mut Commits) -> Result<()> {
     enum Base {
-        Own,
+        /// Against its own base, when that isn't its parent.
+        Own(Option<String>),
         Commit(String),
-        Rebased(String, String),
+        Rebased(Patch, String),
     }
     let mut bases = vec![];
     let mut pairs = vec![];
     for v in &h.versions {
         let to = v.first_sha().to_string();
-        let base = match &v.from {
-            None => Base::Own,
-            Some((_, from)) => {
-                let onto = commits.parent(&to);
-                if onto.is_some() && commits.parent(from) == onto {
-                    Base::Commit(from.clone())
-                } else if let Some(onto) = onto {
-                    pairs.push((from.clone(), onto.clone()));
-                    Base::Rebased(from.clone(), onto)
+        let onto = h.own.base(commits, &to);
+        let base = match (&v.from, &onto) {
+            (Some((_, from)), Some(onto)) => {
+                let from = h.own.patch(commits, from);
+                if from.base.as_ref() == Some(onto) {
+                    Base::Commit(from.sha)
                 } else {
-                    Base::Own
+                    pairs.push((from.clone(), onto.clone()));
+                    Base::Rebased(from, onto.clone())
                 }
             }
+            _ => Base::Own(onto.clone().filter(|b| commits.parent(&to).as_ref() != Some(b))),
         };
         bases.push((to, base));
     }
@@ -605,9 +724,9 @@ fn attach_deltas(h: &mut History, common_dir: &Path, commits: &mut Commits) -> R
         .into_iter()
         .map(|(to, base)| {
             let b = match base {
-                Base::Own => Some(None),
+                Base::Own(b) => Some(b),
                 Base::Commit(c) => Some(Some(c)),
-                Base::Rebased(from, onto) => cached_rebase(&mut h.cache, &from, &onto).map(Some),
+                Base::Rebased(from, onto) => cached_rebase(&mut h.cache, commits, &from, &onto).map(Some),
             };
             (to, b)
         })
@@ -631,6 +750,13 @@ fn attach_deltas(h: &mut History, common_dir: &Path, commits: &mut Commits) -> R
 pub struct Point {
     pub label: String,
     pub sha: String,
+}
+
+/// Where a revert leaves the branch.
+pub struct Revert {
+    pub new: String,
+    /// How it got there, as a line for the user.
+    pub mode: String,
 }
 
 impl History {
@@ -660,23 +786,24 @@ impl History {
 
     /// The two sides of a compare as tree-ishes: `from` re-applied onto `to`'s
     /// base when their bases differ, so the diff is only what changed in the
-    /// patch. `base` on either side is the other side's parent.
+    /// patch. `base` on either side is the other side's base.
     pub fn compare(&mut self, from: &str, to: &str) -> Result<(Point, Point, String, String)> {
         let repo = git::open()?;
         let mut commits = Commits::new(&repo);
-        let parent_of = |commits: &mut Commits, p: &Point| -> Point {
-            let sha = commits.parent(&p.sha).unwrap_or_else(|| EMPTY_TREE.to_string());
+        let own = &self.own;
+        let base_of = |commits: &mut Commits, p: &Point| -> Point {
+            let sha = own.base(commits, &p.sha).unwrap_or_else(|| EMPTY_TREE.to_string());
             Point { label: BASE_ARG.into(), sha }
         };
         let (a, b) = match (from, to) {
             (BASE_ARG, BASE_ARG) => bail!("`base` needs a version on the other side to resolve against"),
             (BASE_ARG, t) => {
                 let b = self.resolve(t)?;
-                (parent_of(&mut commits, &b), b)
+                (base_of(&mut commits, &b), b)
             }
             (f, BASE_ARG) => {
                 let a = self.resolve(f)?;
-                let b = parent_of(&mut commits, &a);
+                let b = base_of(&mut commits, &a);
                 (a, b)
             }
             (f, t) => (self.resolve(f)?, self.resolve(t)?),
@@ -686,19 +813,19 @@ impl History {
         }
         let right = format!("{}^{{tree}}", b.sha);
         if from == BASE_ARG || to == BASE_ARG {
-            // One side is the other's parent: no gap between bases to correct for.
+            // One side is the other's base: no gap between bases to correct for.
             let left = format!("{}^{{tree}}", a.sha);
             return Ok((a, b, left, right));
         }
-        let (pa, pb) = (commits.parent(&a.sha), commits.parent(&b.sha));
-        if pa.is_some() && pa == pb {
+        let (pa, pb) = (self.own.patch(&mut commits, &a.sha), self.own.base(&mut commits, &b.sha));
+        if pa.base.is_some() && pa.base == pb {
             let left = format!("{}^{{tree}}", a.sha);
             return Ok((a, b, left, right));
         }
         let onto = pb.ok_or_else(|| anyhow!("{} is a root commit", b.label))?;
-        rebase_all(&mut self.cache, &mut commits, &[(a.sha.clone(), onto.clone())])?;
+        rebase_all(&mut self.cache, &mut commits, &[(pa.clone(), onto.clone())])?;
         self.cache.save();
-        let Some(left) = cached_rebase(&mut self.cache, &a.sha, &onto) else {
+        let Some(left) = cached_rebase(&mut self.cache, &mut commits, &pa, &onto) else {
             bail!(
                 "re-applying {} onto {}'s base conflicts, so there's no clean interdiff; \
                  `git diff {} {}` diffs them directly, including whatever landed on the base in between",
@@ -711,25 +838,59 @@ impl History {
         Ok((a, b, left, right))
     }
 
-    /// The commit a revert lands on, and a line saying how it got there.
+    /// Where a revert leaves the branch, and a line saying how it got there.
     ///
     /// Everything happens on the tip's own base, so the revert changes content
     /// only; the restack that follows moves the branch if its parent moved.
     /// `--exact` takes the target as it was instead, base and all (or, for
     /// paths, its blobs verbatim), which is the way through a conflict.
-    pub fn plan_revert(&mut self, target: &Point, paths: &[String], exact: bool) -> Result<(String, String)> {
+    ///
+    /// The whole branch goes back to the target's commits: with several, the
+    /// branch is reset to them, dropping the commits after. Paths on a branch
+    /// with several commits are put back by a commit added on top.
+    pub fn plan_revert(&mut self, target: &Point, paths: &[String], exact: bool) -> Result<Revert> {
         let repo = git::open()?;
         let mut commits = Commits::new(&repo);
-        let base = commits.parent(&self.tip).ok_or_else(|| anyhow!("{} is a root commit", self.branch))?;
-        let target_base = commits.parent(&target.sha).ok_or_else(|| anyhow!("{} is a root commit", target.label))?;
+        let (tip_chain, base) = self.own.chain(&mut commits, &self.tip);
+        let base = base.ok_or_else(|| anyhow!("{} is a root commit", self.branch))?;
+        let (target_chain, target_base) = self.own.chain(&mut commits, &target.sha);
+        let target_base = target_base.ok_or_else(|| anyhow!("{} is a root commit", target.label))?;
+        let target_patch = Patch { sha: target.sha.clone(), base: Some(target_base.clone()) };
         let short = ui::short(&target.sha).to_string();
+        let rewrite = |new: String, mode: String| -> Result<Revert> { Ok(Revert { new, mode }) };
+
+        if paths.is_empty() && (exact || target_base == base) {
+            let mode = if exact {
+                format!("exact: back to {short}, on its old base")
+            } else {
+                format!("{short} already sits on the branch's base")
+            };
+            return rewrite(target.sha.clone(), mode);
+        }
+        if paths.is_empty() && target_chain.len() > 1 {
+            let mut own = vec![];
+            for sha in &target_chain {
+                own.push((sha.clone(), vec![commits.parent(sha).unwrap_or_default()]));
+            }
+            return match crate::restack::replay(&own, &base)? {
+                Ok(new) => rewrite(
+                    new,
+                    format!("{}'s {} commits replayed onto the branch's current base", target.label, own.len()),
+                ),
+                Err(_) => bail!(
+                    "replaying {}'s commits onto the branch's current base conflicts; \
+                     rerun with --exact to take them as they were ({short}) instead",
+                    target.label
+                ),
+            };
+        }
 
         let source_tree = if exact || target_base == base {
             git::tree_of(&target.sha)?
         } else {
-            rebase_all(&mut self.cache, &mut commits, &[(target.sha.clone(), base.clone())])?;
+            rebase_all(&mut self.cache, &mut commits, &[(target_patch.clone(), base.clone())])?;
             self.cache.save();
-            cached_rebase(&mut self.cache, &target.sha, &base).ok_or_else(|| {
+            cached_rebase(&mut self.cache, &mut commits, &target_patch, &base).ok_or_else(|| {
                 anyhow!(
                     "re-applying {} onto the branch's current base conflicts; \
                      rerun with --exact to take it as it was ({short}) instead",
@@ -739,16 +900,8 @@ impl History {
         };
 
         if paths.is_empty() {
-            if exact || target_base == base {
-                let mode = if exact {
-                    format!("exact: back to {short}, on its old base")
-                } else {
-                    format!("{short} already sits on the branch's base")
-                };
-                return Ok((target.sha.clone(), mode));
-            }
             let new = git::commit_tree(&source_tree, &base, &git::commit_meta(&target.sha)?)?;
-            return Ok((new, format!("{}'s patch re-applied onto the branch's current base", target.label)));
+            return rewrite(new, format!("{}'s patch re-applied onto the branch's current base", target.label));
         }
 
         let tip_tree = git::tree_of(&self.tip)?;
@@ -765,14 +918,19 @@ impl History {
         if new_tree == tip_tree {
             bail!("{named} already matches {}; nothing to revert", target.label);
         }
-        // The message describes the branch, not the reverted files.
-        let new = git::commit_tree(&new_tree, &base, &git::commit_meta(&self.tip)?)?;
         let mode = if exact {
             format!("those paths copied verbatim from {short}")
         } else {
             format!("those paths as {} has them, re-applied onto the branch's base", target.label)
         };
-        Ok((new, mode))
+        if tip_chain.len() > 1 {
+            let message = format!("Put {named} back as {} had it", target.label);
+            let new = git::commit_tree_as_user(&new_tree, &self.tip, &message)?;
+            return rewrite(new, format!("{mode}, in a new commit"));
+        }
+        // The message describes the branch, not the reverted files.
+        let new = git::commit_tree(&new_tree, &base, &git::commit_meta(&self.tip)?)?;
+        rewrite(new, mode)
     }
 }
 
@@ -929,6 +1087,9 @@ fn print_details(v: &Version, uniform: bool) {
     let indent = "         ";
     if !uniform {
         println!("{indent}{}", ui::dim(&v.subject));
+    }
+    if !v.tip {
+        println!("{indent}{}", ui::dim("↳ passed through: arrived under a later commit, never the tip here"));
     }
     if let Some(d) = v.delta.as_ref().filter(|d| !d.conflict) {
         let (gen_files, mut files): (Vec<&loc::FileStat>, Vec<&loc::FileStat>) =

@@ -66,9 +66,16 @@ fn branch_values(repo: &gix::Repository, key: &str) -> HashMap<String, String> {
 }
 
 /// Branches `gt sync` couldn't restack cleanly, marked by `branch.<b>.gtNeedsRebase`
-/// (value: the branch's tip at the time). A mark only counts while the tip is unchanged.
-fn rebase_marks(repo: &gix::Repository) -> HashMap<String, String> {
+/// (value: the branch's tip at the time, then the commit its own commits sit on
+/// when that isn't the tip's parent). A mark only counts while the tip is unchanged.
+fn rebase_marks(repo: &gix::Repository) -> HashMap<String, (String, Option<String>)> {
     branch_values(repo, "gtNeedsRebase")
+        .into_iter()
+        .map(|(b, v)| {
+            let mut f = v.split_whitespace().map(str::to_string);
+            (b, (f.next().unwrap_or_default(), f.next()))
+        })
+        .collect()
 }
 
 /// The remote commit gt last reconciled each branch with, `branch.<b>.gtSynced`:
@@ -95,7 +102,7 @@ pub struct Ctx {
     pub worktrees: HashMap<String, PathBuf>,
     /// Review branches that still exist locally.
     pub reviews: Vec<Review>,
-    rebase_marks: HashMap<String, String>,
+    rebase_marks: HashMap<String, (String, Option<String>)>,
     synced: HashMap<String, String>,
     upstreams: HashMap<String, (String, String)>,
     lock: Option<Lock>,
@@ -166,7 +173,7 @@ impl Ctx {
 
     /// Whether `gt sync` skipped this branch on a conflict and it hasn't moved since.
     pub fn needs_rebase(&self, branch: &str) -> bool {
-        self.rebase_marks.get(branch).is_some_and(|sha| self.refs.head(branch) == Some(sha.as_str()))
+        self.rebase_marks.get(branch).is_some_and(|(sha, _)| self.refs.head(branch) == Some(sha.as_str()))
     }
 
     /// The commit a marked branch still sits on: its parent's tip from before the
@@ -175,14 +182,24 @@ impl Ctx {
         if !self.needs_rebase(branch) {
             return None;
         }
-        self.refs.heads.get(branch)?.parents.first().map(String::as_str)
+        match &self.rebase_marks.get(branch)?.1 {
+            Some(base) => Some(base),
+            None => self.refs.heads.get(branch)?.parents.first().map(String::as_str),
+        }
     }
 
-    /// Marks `branch` as needing a hand rebase, at its current tip.
-    pub fn mark_needs_rebase(&mut self, branch: &str) -> Result<()> {
-        let Some(tip) = self.refs.head(branch).map(str::to_string) else { return Ok(()) };
-        git::run(&["config", &format!("branch.{branch}.gtNeedsRebase"), &tip])?;
-        self.rebase_marks.insert(branch.to_string(), tip);
+    /// Marks `branch` as needing a hand rebase, at its current tip. `base` is
+    /// the commit its own commits sit on, when known.
+    pub fn mark_needs_rebase(&mut self, branch: &str, base: Option<&str>) -> Result<()> {
+        let Some(c) = self.refs.heads.get(branch) else { return Ok(()) };
+        // With one commit of its own the base is the tip's parent, so the tip alone says it.
+        let base = base.filter(|b| c.parents.first().map(String::as_str) != Some(*b)).map(str::to_string);
+        let value = match &base {
+            Some(b) => format!("{} {b}", c.sha),
+            None => c.sha.clone(),
+        };
+        git::run(&["config", &format!("branch.{branch}.gtNeedsRebase"), &value])?;
+        self.rebase_marks.insert(branch.to_string(), (c.sha.clone(), base));
         Ok(())
     }
 

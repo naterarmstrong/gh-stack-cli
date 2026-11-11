@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 use commands::Nav;
 
 /// Fast, Graphite-style stacked PRs on top of gh-stack's state and GitHub's stacks API.
-/// Assumes one commit per branch.
+/// Built around one commit per branch; a branch with several treats each commit as a version.
 #[derive(Parser)]
 #[command(name = "gt", version)]
 struct Cli {
@@ -66,15 +66,19 @@ enum Cmd {
         #[arg(long)]
         base: Option<String>,
     },
-    /// Amend the current branch's commit and restack everything above it
+    /// Amend the current branch's commit (or add one, if it has several) and restack everything above it
     #[command(visible_alias = "m")]
     Modify {
         /// Stage all changes first
         #[arg(short, long)]
         all: bool,
-        /// Replace the commit message
+        /// Replace the commit message (or, for a new commit, set it)
         #[arg(short, long)]
         message: Option<String>,
+        /// Add a commit instead of amending a branch's only one. A branch with
+        /// several commits always gets a new one.
+        #[arg(long)]
+        new_commit: bool,
     },
     /// Rebase each branch onto its parent (in memory, no checkouts)
     #[command(visible_alias = "r")]
@@ -244,7 +248,7 @@ fn main() {
         Cmd::Trunk => commands::nav(Nav::Trunk),
         Cmd::Checkout { target } => commands::checkout_cmd(target),
         Cmd::Create { name, message, all, base } => commands::create(name, message, all, base),
-        Cmd::Modify { all, message } => commands::modify(all, message),
+        Cmd::Modify { all, message, new_commit } => commands::modify(all, message, new_commit),
         Cmd::Restack { trunk } => commands::restack_cmd(trunk),
         Cmd::Squash => commands::squash_cmd(),
         Cmd::Continue => commands::continue_cmd(),

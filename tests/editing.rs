@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::World;
+use common::{World, line_of};
 
 #[test]
 fn create_from_trunk_starts_a_stack() {
@@ -196,6 +196,43 @@ fn modify_with_nothing_staged_just_restacks() {
 }
 
 #[test]
+fn modify_adds_a_commit_to_a_branch_that_has_several() {
+    let w = World::new();
+    w.create("feat-a", "a.txt", "a\n");
+    w.commit("a.txt", "a2\n", "More a");
+    w.create("feat-b", "b.txt", "b\n");
+    w.git(&["checkout", "--quiet", "feat-a"]);
+
+    w.write("a.txt", "a3\n");
+    let out = w.gt_ok(&["modify", "-a", "-m", "Even more a"]);
+    assert!(out.stderr.contains("restacked feat-b"), "{out:?}");
+    assert_eq!(w.count("main..feat-a"), 3);
+    assert_eq!(w.git(&["log", "-1", "--format=%s", "feat-a"]), "Even more a");
+    assert_eq!(w.git(&["log", "-1", "--format=%s", "feat-a~1"]), "More a", "earlier commits untouched");
+    assert_eq!(w.parent("feat-b"), w.head("feat-a").unwrap());
+
+    // Nothing staged: no empty commit, just the restack.
+    let out = w.gt_ok(&["modify"]);
+    assert!(out.stderr.contains("nothing staged"), "{out:?}");
+    assert_eq!(w.count("main..feat-a"), 3);
+}
+
+#[test]
+fn modify_new_commit_adds_one_to_a_single_commit_branch() {
+    let w = World::new();
+    w.create("feat-a", "a.txt", "a\n");
+    w.write("a.txt", "a2\n");
+    w.gt_ok(&["modify", "-a", "--new-commit", "-m", "Second"]);
+    assert_eq!(w.count("main..feat-a"), 2);
+    assert_eq!(w.git(&["log", "--format=%s", "main..feat-a"]), "Second\nAdd a.txt");
+
+    // Once it has two, plain modify keeps adding.
+    w.write("a.txt", "a3\n");
+    w.gt_ok(&["modify", "-a", "-m", "Third"]);
+    assert_eq!(w.count("main..feat-a"), 3);
+}
+
+#[test]
 fn modify_outside_a_stack_only_amends() {
     let w = World::new();
     w.git(&["checkout", "--quiet", "-b", "loose"]);
@@ -253,23 +290,55 @@ fn restack_trunk_moves_the_bottom_onto_the_remote_trunk() {
 }
 
 #[test]
-fn restack_refuses_a_branch_with_several_commits() {
+fn restack_replays_every_commit_of_a_branch() {
     let w = World::new();
     w.create("feat-a", "a.txt", "a\n");
     w.create("feat-b", "b.txt", "b\n");
     w.commit("b.txt", "b2\n", "More b");
+    w.gt_ok(&["create", "feat-c"]);
+    w.commit("c.txt", "c\n", "Add c.txt");
     w.git(&["checkout", "--quiet", "feat-a"]);
     w.write("a.txt", "a2\n");
+    w.git(&["commit", "--quiet", "-a", "--amend", "--no-edit"]);
+
+    let out = w.gt_ok(&["restack"]);
+    assert!(out.stderr.contains("restacked feat-b"), "{out:?}");
+    let a = w.head("feat-a").unwrap();
+    assert_eq!(w.count(&format!("{a}..feat-b")), 2, "both commits replayed");
+    assert_eq!(w.git(&["rev-parse", "feat-b~2"]), a);
+    assert_eq!(w.git(&["log", "--format=%s", "feat-a..feat-b"]), "More b\nAdd b.txt");
+    assert_eq!(w.show("feat-b~1", "b.txt").as_deref(), Some("b\n"));
+    assert_eq!(w.show("feat-b", "b.txt").as_deref(), Some("b2\n"));
+    assert_eq!(w.show("feat-b", "a.txt").as_deref(), Some("a2\n"));
+    assert_eq!(w.parent("feat-c"), w.head("feat-b").unwrap());
+    // gh-stack's base is where the branch's own commits start.
+    assert_eq!(w.branch_state("feat-b")["base"], a.as_str());
+
+    let out = w.gt_ok(&["restack"]);
+    assert!(out.stderr.contains("already restacked"), "{out:?}");
+}
+
+#[test]
+fn a_multi_commit_conflict_remembers_where_its_commits_start() {
+    let w = World::new();
+    w.create("feat-a", "shared.txt", "one\n");
+    w.create("feat-b", "b.txt", "b\n");
+    w.commit("shared.txt", "two\n", "Edit shared");
+    let old_a = w.head("feat-a").unwrap();
+    w.git(&["checkout", "--quiet", "feat-a"]);
+    w.write("shared.txt", "uno\n");
     w.git(&["commit", "--quiet", "-a", "--amend", "--no-edit"]);
     let b = w.head("feat-b").unwrap();
 
     let out = w.gt_err(&["restack"]);
-    assert!(out.stderr.contains("feat-b has 2 commits of its own"), "{out:?}");
-    assert!(out.stderr.contains("gt squash"), "{out:?}");
+    assert!(out.stderr.contains("conflict restacking feat-b"), "{out:?}");
+    let out = w.gt_ok(&["abort"]);
+    assert!(out.stderr.contains("marked it as needing a rebase"), "{out:?}");
     assert_eq!(w.head("feat-b").unwrap(), b);
-    // Squashing can't help either: feat-b no longer sits on feat-a's tip.
-    let out = w.gt_err(&["squash"]);
-    assert!(out.stderr.contains("doesn't contain its parent's current tip"), "{out:?}");
+    let mark = format!("{b} {old_a}");
+    assert_eq!(w.config("branch.feat-b.gtNeedsRebase").as_deref(), Some(mark.as_str()));
+    // Both commits still count as feat-b's.
+    assert!(line_of(&w.gt_ok(&["ls"]).stdout, "feat-b").contains("needs rebase"));
 }
 
 #[test]

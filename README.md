@@ -4,7 +4,7 @@ A fast, Graphite-style CLI for stacked PRs, built on `gh stack`'s state and GitH
 
 `gt` reads and writes the same `.git/gh-stack` file that `gh stack` uses (unknown fields are kept, and it takes the same lock files), so you can switch between the two tools freely. Branches you haven't submitted yet live in gt's own `.git/gt-stack` instead (see [Local branches](#local-branches)), so `gh stack submit` never opens PRs for them. It restacks in memory with `git merge-tree` + `git commit-tree`, so restacking never checks out a branch or touches a working tree, and it batches GitHub calls into single GraphQL round trips.
 
-**It assumes one commit per branch.** That rule keeps restacking simple: a branch's old base is always its tip's parent. `gt squash` folds a branch with several commits back into one.
+**It is built around one commit per branch.** With one commit, a branch's old base is always its tip's parent, and `gt modify` amends that commit, so each amend is a new version of the branch. A branch can also have several commits, such as one a cloud agent keeps pushing to. Then each commit counts as a version, the way each amend does on a single-commit branch, and gt restacks, syncs and reverts the branch with all of its commits. See [Branches with several commits](#branches-with-several-commits). `gt squash` folds a branch with several commits back into one.
 
 ## Install
 
@@ -59,12 +59,24 @@ Aliases are in parentheses.
 | --- | --- |
 | `gt history [branch]` (`h`) | Every version of a branch's commit, newest first: p1, p2, … with when and how each appeared, whether it reached the remote, and what it changed over the version before. `--json` gives machine-readable output. |
 | `gt history show <n>` | What version `n` changed over its own base, as a diff. This is the PR as it was at that version. |
-| `gt history compare [a b]` | What changed from version `a` to version `b`. With no versions it compares the previous version with the current one. `base` stands for the other side's parent. `--json` gives the endpoints, the two trees and the changed files. |
-| `gt history revert <n> [-- paths…]` | Put the branch, or only the given paths, back on version `n`, then restack like `gt modify`. `--exact` takes the version as it was (its old base, or its files verbatim) for when re-applying it conflicts. `-y` skips the confirmation. |
+| `gt history compare [a b]` | What changed from version `a` to version `b`. With no versions it compares the previous version with the current one. `base` stands for the other side's base: its parent, or on a branch with several commits, the commit the oldest of them sits on. `--json` gives the endpoints, the two trees and the changed files. |
+| `gt history revert <n> [-- paths…]` | Put the branch, or only the given paths, back on version `n`, then restack like `gt modify`. On a branch with several commits, the whole branch is reset to version `n`'s commit, which drops the commits after it, and reverting paths adds a commit instead. `--exact` takes the version as it was (its old base, or its files verbatim) for when re-applying it conflicts. `-y` skips the confirmation. |
 
 These commands take a branch with `-b`. Versions are named `p3` or `3`, and any commit works too.
 
 Since `gt modify` amends the branch's one commit, the branch's reflog holds every version of it. A move that keeps the patch, such as a restack or a revert back to an earlier version, folds into that version (by `git patch-id`) instead of adding a new one. What a version changed is an interdiff: the earlier patch is re-applied onto the later one's base before diffing, so whatever landed on the parent in between is left out. Reflogs are per-clone, so the history only covers this clone, and "pushed"/"fetched" only cover pushes and fetches made from it. Patch-ids and re-applied trees are cached under `<git-common-dir>/gt/history-v<N>.json`, where an entry is dropped once it goes 30 days without being read, and diff sizes share `gt loc`'s cache, so a warm run reads the reflogs and spawns a single `git rev-list`.
+
+### Branches with several commits
+
+One commit per branch is the simple case, and nothing changes for it. When a branch has several commits of its own, meaning the commits not on trunk or a branch below it:
+
+- **Versions:** each commit is a version, and its patch is the branch's whole change up to that commit, measured from the commit the oldest one sits on. On a single-commit branch that is just the commit's diff, so the two cases follow one rule. A commit the branch only passed through also gets a version, such as the first two of three commits a fetch brought in at once (the reflog only records the third). `gt history` marks it "passed through", and `--json` gives it `"tip": false`. A restack of every commit, a `gt squash`, or a reset back to a commit keeps the branch's change, so it folds into the version it already had.
+- **Restack** replays the commits one at a time, in memory, keeping each commit's message and author. A conflict stops at the first commit that doesn't apply, and resolving it is the same `git rebase` as for one commit. A branch whose own commits include a merge isn't restacked; `gt squash` folds it.
+- **`gt modify`** adds a commit rather than amending the last one.
+- **`gt history revert`** resets the branch to the version's commit and drops the commits after it. A version on an older base has its commits replayed onto the branch's current one. Reverting only some paths adds a commit.
+- **`gt sync`** takes commits pushed on top of the branch as they are, as long as they continue it in a line. A single-commit branch still folds a push back into its one commit.
+- **`gt submit`** opens the PR with the oldest commit's message as its title and body.
+- **`gt ls`** shows the number of commits. A branch is restacked when its oldest commit sits on its parent.
 
 ### Moving around
 
@@ -80,7 +92,7 @@ Since `gt modify` amends the branch's one commit, the branch's reflog holds ever
 | Command | What it does |
 | --- | --- |
 | `gt create [name] -m <msg>` (`c`) | Create a branch above the current one and commit staged changes to it. `--base <branch>` puts it above that branch (name or PR number) instead; uncommitted changes come along, as with `git checkout -b`. `-a` stages everything first. The name comes from the message if you leave it out. The branch is local until submitted, unless it goes below a branch that's already shared. |
-| `gt modify` (`m`) | Amend the current branch's commit (or make the first one if the branch has none), then restack everything above it. On a branch outside any stack it just amends (or makes the first commit on top of trunk), with nothing to restack. `-a` stages everything, `-m` replaces the message. |
+| `gt modify` (`m`) | Amend the current branch's commit (or make the first one if the branch has none), then restack everything above it. A branch that already has several commits gets a new commit instead, and `--new-commit` adds one to a single-commit branch too. On a branch outside any stack it just commits, with nothing to restack. `-a` stages everything, `-m` replaces the message (or sets it, for a new commit). With nothing staged, it only restacks. |
 | `gt restack` (`r`) | Rebase each branch onto its parent, in memory. `--trunk` also moves the bottom branch onto the latest remote trunk. |
 | `gt squash` | Fold each branch in the stack down to one commit. The content stays the same. |
 | `gt continue` | Carry on after you resolve a restack conflict (finishes a `git rebase` in progress first). Once the whole stack is restacked, it checks out the branch you were on when the conflict started. |

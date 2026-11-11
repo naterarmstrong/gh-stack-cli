@@ -1,6 +1,9 @@
 //! In-memory restacking. With one commit per branch, a branch's old base is
 //! simply its tip's parent, so each branch is replayed with `git merge-tree`
 //! + `git commit-tree` without touching any working tree.
+//!
+//! A branch with several commits is replayed the same way, a commit at a time,
+//! from the parent of its oldest commit that isn't below it.
 
 use crate::ctx::Ctx;
 use crate::git::{self, Merge};
@@ -69,41 +72,38 @@ fn plan_below(ctx: &Ctx, si: usize, onto_trunk: bool, skip_conflicts: bool, end:
         let new = if old_parent_head.as_deref() == Some(&c.sha) || c.sha == parent_tip {
             // Branch has no commit of its own yet; it just follows its parent.
             parent_tip.clone()
+        } else if c.parents.len() == 1 && c.parents[0] == parent_tip {
+            c.sha.clone()
         } else {
-            if c.parents.len() != 1 {
-                bail!("{} tip is a merge or root commit; gt expects exactly one commit per branch", b.branch);
+            let own = git::own_chain(&c.sha, &below)?;
+            if own.iter().any(|(_, parents)| parents.len() != 1) {
+                bail!("{} has a merge or root commit of its own; run `gt squash` to fold it", b.branch);
             }
-            let base = &c.parents[0];
-            if *base == parent_tip {
-                c.sha.clone()
-            } else {
-                // Replaying only the tip of a multi-commit branch would drop the rest.
-                let own = git::own_commits(&c.sha, &below)?;
-                if own.len() > 1 {
-                    bail!(
-                        "{} has {} commits of its own; gt needs one commit per branch. Run `gt squash` to fold them.",
-                        b.branch,
-                        own.len()
-                    );
-                }
-                match git::merge_tree(base, &parent_tip, &c.sha)? {
-                    Merge::Clean(tree) => git::commit_tree(&tree, &parent_tip, &git::commit_meta(&c.sha)?)?,
-                    Merge::Conflict(files) => {
-                        conflicts.push(Conflict {
-                            branch: b.branch.clone(),
-                            onto: parent_tip,
-                            onto_name: parent_name,
-                            base: base.clone(),
-                            files,
-                        });
-                        if !skip_conflicts {
-                            return Ok(Plan { updates, conflicts, clean });
+            match own.first() {
+                // Nothing of its own above what's below it: it follows its parent.
+                None => parent_tip.clone(),
+                Some((_, p)) if p[0] == parent_tip => c.sha.clone(),
+                Some((_, p)) => {
+                    let base = p[0].clone();
+                    match replay(&own, &parent_tip)? {
+                        Ok(new) => new,
+                        Err(files) => {
+                            conflicts.push(Conflict {
+                                branch: b.branch.clone(),
+                                onto: parent_tip,
+                                onto_name: parent_name,
+                                base,
+                                files,
+                            });
+                            if !skip_conflicts {
+                                return Ok(Plan { updates, conflicts, clean });
+                            }
+                            // Leave it where it is; the branches above follow it there.
+                            below.extend([b.head.clone(), c.sha.clone()]);
+                            old_parent_head = Some(c.sha.clone());
+                            parent = Some((b.branch.clone(), c.sha.clone()));
+                            continue;
                         }
-                        // Leave it where it is; the branches above follow it there.
-                        below.extend([b.head.clone(), c.sha.clone()]);
-                        old_parent_head = Some(c.sha.clone());
-                        parent = Some((b.branch.clone(), c.sha.clone()));
-                        continue;
                     }
                 }
             }
@@ -117,6 +117,20 @@ fn plan_below(ctx: &Ctx, si: usize, onto_trunk: bool, skip_conflicts: bool, end:
         parent = Some((b.branch.clone(), new));
     }
     Ok(Plan { updates, conflicts, clean })
+}
+
+/// Replays a branch's own commits (oldest first, each with its parents) onto
+/// `onto`, one at a time, keeping each commit's message and author. Gives the
+/// new tip, or the conflicting files of the first commit that doesn't apply.
+pub fn replay(own: &[(String, Vec<String>)], onto: &str) -> Result<std::result::Result<String, Vec<String>>> {
+    let mut tip = onto.to_string();
+    for (sha, parents) in own {
+        match git::merge_tree(&parents[0], &tip, sha)? {
+            Merge::Clean(tree) => tip = git::commit_tree(&tree, &tip, &git::commit_meta(sha)?)?,
+            Merge::Conflict(files) => return Ok(Err(files)),
+        }
+    }
+    Ok(Ok(tip))
 }
 
 /// Commits that can never belong to a stacked branch: the trunk, local and remote.
@@ -197,12 +211,19 @@ pub fn record_heads(ctx: &mut Ctx) {
         {
             stack.trunk.head = tip.clone();
         }
+        // The tip of the nearest unmerged branch below, which a restacked branch sits on.
+        let mut below = stack.trunk.head.clone();
         for b in stack.branches.iter_mut().filter(|b| !b.merged()) {
             if let Some(c) = refs.heads.get(&b.branch) {
                 b.head = c.sha.clone();
-                if let Some(p) = c.parents.first() {
+                let first = c.parents.first();
+                if first.is_some_and(|p| *p != below) && c.sha != below && git::is_ancestor(&below, &c.sha) {
+                    // Several commits of its own, on the branch below.
+                    b.base = below.clone();
+                } else if let Some(p) = first {
                     b.base = p.clone();
                 }
+                below = c.sha.clone();
             }
         }
     }
@@ -230,7 +251,7 @@ pub fn run_skipping(ctx: &mut Ctx, si: usize, onto_trunk: bool) -> Result<Vec<St
     apply(ctx, &plan.updates)?;
     clear_marks(ctx, &plan.clean);
     for c in &plan.conflicts {
-        ctx.mark_needs_rebase(&c.branch)?;
+        ctx.mark_needs_rebase(&c.branch, Some(&c.base))?;
         ui::warn(&format!(
             "skipped {}: it conflicts with {} in\n{}",
             ui::bold(&c.branch),
@@ -252,7 +273,7 @@ pub fn run_below_conflict(ctx: &mut Ctx, si: usize) -> Result<usize> {
     apply(ctx, &plan.updates)?;
     clear_marks(ctx, &plan.clean);
     if let Some(c) = plan.conflicts.first() {
-        ctx.mark_needs_rebase(&c.branch)?;
+        ctx.mark_needs_rebase(&c.branch, Some(&c.base))?;
     }
     Ok(stop)
 }
@@ -263,8 +284,9 @@ fn clear_marks(ctx: &mut Ctx, branches: &[String]) {
     }
 }
 
-/// Where `start_conflict` notes the branch to return to on `gt abort`, and
-/// the branch being rebased: `<git-dir>/gt-rebase`, one name per line.
+/// Where `start_conflict` notes the branch to return to on `gt abort`, the
+/// branch being rebased, and the commit its own commits sat on:
+/// `<git-dir>/gt-rebase`, one per line.
 pub fn abort_file(git_dir: &std::path::Path) -> std::path::PathBuf {
     git_dir.join("gt-rebase")
 }
@@ -294,7 +316,7 @@ fn start_conflict(ctx: &mut Ctx, c: &Conflict) -> Result<()> {
         return Ok(());
     }
     let orig = ctx.info.current_branch.clone().unwrap_or_default();
-    std::fs::write(abort_file(&ctx.info.git_dir), format!("{orig}\n{}\n", c.branch))?;
+    std::fs::write(abort_file(&ctx.info.git_dir), format!("{orig}\n{}\n{}\n", c.branch, c.base))?;
     if orig != c.branch {
         git::run(&["checkout", "--quiet", &c.branch])?;
     }

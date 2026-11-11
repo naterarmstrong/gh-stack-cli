@@ -168,7 +168,8 @@ fn ls_flags_multi_commit_and_stale_branches() {
     w.gt_ok(&["co", "feat-b"]);
     w.commit("b.txt", "b2\n", "Second commit");
     let out = w.gt_ok(&["ls"]);
-    assert!(line_of(&out.stdout, "feat-b").contains("2 commits (gt squash)"), "{out:?}");
+    let b = line_of(&out.stdout, "feat-b");
+    assert!(b.contains("2 commits") && !b.contains("squash") && !b.contains("needs restack"), "{out:?}");
     assert!(line_of(&out.stdout, "feat-c").contains("needs restack"), "{out:?}");
 
     // Trunk moving on shows as "behind" on the bottom branch.

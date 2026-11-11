@@ -66,16 +66,20 @@ fn local_badges(ctx: &Ctx, stack: &Stack, idx: usize) -> Vec<String> {
     };
     if let Some(p) = parent_tip {
         if c.parents.first() != Some(p) && c.sha != *p && !ctx.needs_rebase(&b.branch) {
-            // Only off the happy path: count the branch's own commits (one git call).
-            let own = git::own_commits(&c.sha, &below_heads(ctx, stack, idx)).map(|v| v.len()).unwrap_or(1);
-            out.push(if own > 1 {
-                ui::red(&format!("{own} commits (gt squash)"))
-            } else if parent == stack.trunk.branch {
-                let behind = git::ahead_behind(&c.sha, p).map(|(_, n)| format!("{n} ")).unwrap_or_default();
-                ui::dim(&format!("{behind}behind {}", trunk_label(ctx, parent)))
-            } else {
-                ui::yellow("needs restack")
-            });
+            // Only off the happy path: read the branch's own commits (one git call).
+            let own = git::own_chain(&c.sha, &below_heads(ctx, stack, idx)).unwrap_or_default();
+            if own.len() > 1 {
+                out.push(ui::dim(&format!("{} commits", own.len())));
+            }
+            // Several commits still sit on the parent when the oldest one does.
+            if own.first().and_then(|(_, ps)| ps.first()) != Some(p) {
+                out.push(if parent == stack.trunk.branch {
+                    let behind = git::ahead_behind(&c.sha, p).map(|(_, n)| format!("{n} ")).unwrap_or_default();
+                    ui::dim(&format!("{behind}behind {}", trunk_label(ctx, parent)))
+                } else {
+                    ui::yellow("needs restack")
+                });
+            }
         }
     }
     match ctx.refs.remote.get(&b.branch) {
@@ -844,39 +848,50 @@ fn exit_on_conflict(clean: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn modify(all: bool, message: Option<String>) -> Result<()> {
+pub fn modify(all: bool, message: Option<String>, new_commit: bool) -> Result<()> {
     let mut ctx = Ctx::new(true)?;
     let cur = ctx.current()?.to_string();
     let si = ctx.store.file.find(&cur);
-    // A branch sitting exactly on its parent has no commit yet: make one instead of amending.
-    let empty = match si {
+    // What belongs below the branch, and whether it has a commit of its own yet:
+    // a branch sitting exactly on its parent has none, so make one instead of amending.
+    let (below, empty) = match si {
         Some(si) => {
             let stack = &ctx.store.file.stacks[si];
-            let parent = stack.parent_of(stack.index_of(&cur).unwrap()).to_string();
+            let idx = stack.index_of(&cur).unwrap();
+            let parent = stack.parent_of(idx).to_string();
             let head = ctx.refs.head(&cur).unwrap_or_default();
-            ctx.refs.head(&parent) == Some(head) || ctx.refs.remote.get(&parent).map(String::as_str) == Some(head)
+            let empty =
+                ctx.refs.head(&parent) == Some(head) || ctx.refs.remote.get(&parent).map(String::as_str) == Some(head);
+            (below_heads(&ctx, stack, idx), empty)
         }
         // Outside a stack there's no parent to compare with, so go by trunk: a branch
         // with nothing of its own on top of it has no commit yet.
         None => {
             let trunk = ctx.default_trunk();
-            [ctx.remote_ref(&trunk), trunk].iter().any(|t| git::rev_parse(t).is_some() && git::is_ancestor("HEAD", t))
+            let trunks: Vec<String> =
+                [ctx.remote_ref(&trunk), trunk].into_iter().filter(|t| git::rev_parse(t).is_some()).collect();
+            let empty = trunks.iter().any(|t| git::is_ancestor("HEAD", t));
+            (trunks, empty)
         }
     };
+    // A branch that already has several commits grows by commits; one with a
+    // single commit keeps it, amended, unless asked for another.
+    let amend = !empty && !new_commit && git::own_commits("HEAD", &below)?.len() <= 1;
 
     if all {
         git::run(&["add", "-A"])?;
     }
     let mut args = vec!["commit", "--quiet"];
-    if !empty {
+    if amend {
         args.push("--amend");
     }
     match &message {
         Some(m) => args.extend(["-m", m.as_str()]),
-        None if !empty => args.push("--no-edit"),
+        None if amend => args.push("--no-edit"),
         None => {}
     }
-    if !empty && message.is_none() && !git::has_staged_changes()? {
+    // A message alone still rewords an amend; a new commit needs something staged.
+    if !empty && (message.is_none() || !amend) && !git::has_staged_changes()? {
         ui::info(if si.is_some() { "nothing staged; just restacking" } else { "nothing staged" });
     } else if !git::run_interactive(None, &args)? {
         bail!("git commit failed");
@@ -963,7 +978,8 @@ pub fn abort_cmd() -> Result<()> {
     let git_dir = git::repo_info(&git::open()?)?.git_dir;
     let note = std::fs::read_to_string(restack::abort_file(&git_dir)).unwrap_or_default();
     let mut lines = note.lines();
-    let (orig, branch) = (lines.next().unwrap_or(""), lines.next().unwrap_or(""));
+    let (orig, branch, base) =
+        (lines.next().unwrap_or(""), lines.next().unwrap_or(""), lines.next().filter(|l| !l.is_empty()));
     if !git::rebase_in_progress(&git_dir) {
         let _ = std::fs::remove_file(restack::abort_file(&git_dir));
         bail!("no rebase in progress");
@@ -975,7 +991,7 @@ pub fn abort_cmd() -> Result<()> {
     let mut ctx = Ctx::new(false)?;
     let branch = if branch.is_empty() { ctx.info.current_branch.clone().unwrap_or_default() } else { branch.into() };
     if !branch.is_empty() {
-        ctx.mark_needs_rebase(&branch)?;
+        ctx.mark_needs_rebase(&branch, base)?;
         ui::ok(&format!("aborted restacking {}; marked it as needing a rebase", ui::bold(&branch)));
     }
     if !orig.is_empty() && ctx.info.current_branch.as_deref() != Some(orig) && ctx.refs.heads.contains_key(orig) {
@@ -1182,11 +1198,27 @@ fn push(ctx: &mut Ctx, branches: &[String], no_verify: bool) -> Result<()> {
 }
 
 /// Whether `sha` carries the same patch as any of `others`, so a restack of a
-/// commit matches it. A commit that isn't in this repo matches nothing.
-fn same_patch_as_any(ctx: &Ctx, sha: &str, others: &[&str]) -> bool {
-    let all: Vec<&str> = std::iter::once(sha).chain(others.iter().copied()).collect();
-    let ids = history::patch_ids_of(&ctx.info.common_dir, &all).unwrap_or_default();
-    ids.get(sha).is_some_and(|p| others.iter().any(|o| ids.get(*o) == Some(p)))
+/// commit matches it. A commit that isn't in this repo matches nothing. With
+/// several commits of its own (`below` decides which), the patch is the
+/// branch's whole change, so a restack of every commit matches.
+fn same_patch_as_any(ctx: &Ctx, sha: &str, others: &[&str], below: &[String]) -> bool {
+    let base_of = |s: &str| -> Option<String> {
+        let own = git::own_chain(s, below).ok()?;
+        own.first().and_then(|(_, ps)| ps.first().cloned()).filter(|_| own.len() > 1)
+    };
+    // One commit: its own diff, as every earlier run measured it.
+    let Some(base) = base_of(sha) else {
+        let all: Vec<(&str, Option<&str>)> =
+            std::iter::once(sha).chain(others.iter().copied()).map(|s| (s, None)).collect();
+        let ids = history::patch_ids_of(&ctx.info.common_dir, &all).unwrap_or_default();
+        return ids.get(sha).is_some_and(|p| others.iter().any(|o| ids.get(*o) == Some(p)));
+    };
+    let mine = history::patch_ids_of(&ctx.info.common_dir, &[(sha, Some(&base))]).unwrap_or_default();
+    let Some(p) = mine.get(sha) else { return false };
+    others.iter().any(|o| {
+        let theirs = base_of(o);
+        history::patch_ids_of(&ctx.info.common_dir, &[(o, theirs.as_deref())]).is_ok_and(|ids| ids.get(*o) == Some(p))
+    })
 }
 
 /// Branches whose remote-tracking ref holds a commit that gt never synced the
@@ -1219,10 +1251,25 @@ fn needs_push(ctx: &Ctx, si: usize) -> Vec<String> {
 }
 
 /// Takes a remote branch that someone else pushed to (a bot fix, a teammate)
-/// and folds it back into a single commit on the branch.
-fn adopt_remote(ctx: &mut Ctx, branch: &str, parent_ref: &str) -> Result<()> {
+/// and folds it back into a single commit on the branch. A branch that
+/// already has several commits takes the remote's commits as they are instead,
+/// as long as they sit in a line on the commit its own commits sit on.
+fn adopt_remote(ctx: &mut Ctx, branch: &str, parent_ref: &str, below: &[String]) -> Result<()> {
     let remote = ctx.refs.remote[branch].clone();
     let local = ctx.refs.heads.get(branch).cloned();
+    if let Some(l) = &local {
+        let own = git::own_chain(&l.sha, below)?;
+        if let Some(base) = own.first().and_then(|(_, ps)| ps.first()).filter(|_| own.len() > 1) {
+            let linear = git::is_ancestor(base, &remote)
+                && git::own_chain(&remote, std::slice::from_ref(base))?.iter().all(|(_, ps)| ps.len() == 1);
+            if linear {
+                ctx.set_branch(branch, Some(&l.sha), &remote, "gt sync: pull remote")?;
+                ctx.set_synced(branch, &remote)?;
+                ui::ok(&format!("pulled remote changes into {}", ui::bold(branch)));
+                return Ok(());
+            }
+        }
+    }
     let base = match &local {
         Some(l) if l.parents.len() == 1 && git::is_ancestor(&l.sha, &remote) => l.parents[0].clone(),
         _ => {
@@ -1347,6 +1394,8 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
     struct Pull {
         branch: String,
         parent_ref: String,
+        /// Commits that belong below the branch.
+        below: Vec<String>,
         local: Option<String>,
         pr: Option<u64>,
         /// Whether there's evidence the remote moved past what local came from.
@@ -1370,12 +1419,13 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
                 continue;
             }
             let old_r = old_remote.get(&b.branch);
+            let below = below_heads(&ctx, &s, idx);
             let stale = match &local {
                 None => true,
                 Some(l) => {
                     Some(l) == old_r
                         || git::is_ancestor(l, &remote)
-                        || synced.as_deref().is_some_and(|s| s == l || same_patch_as_any(&ctx, l, &[s]))
+                        || synced.as_deref().is_some_and(|s| s == l || same_patch_as_any(&ctx, l, &[s], &below))
                 }
             };
             let parent = s.parent_of(idx);
@@ -1386,6 +1436,7 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
                 } else {
                     format!("refs/heads/{parent}")
                 },
+                below,
                 local,
                 pr: prs.get(&b.branch).map(|p| p.number).or(b.pr_number()),
                 moved: synced.is_some() || old_r != Some(&remote),
@@ -1401,7 +1452,7 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
                     let (Some(l), Some(h)) = (&p.local, p.pr.and_then(|n| heads.get(&n))) else { continue };
                     let h: Vec<&str> = h.iter().map(String::as_str).collect();
                     // Local was once the PR's head, or is a restack of one: the remote has moved on from it.
-                    if h.contains(&l.as_str()) || same_patch_as_any(&ctx, l, &h) {
+                    if h.contains(&l.as_str()) || same_patch_as_any(&ctx, l, &h, &p.below) {
                         p.stale = true;
                         p.moved = true;
                     }
@@ -1412,7 +1463,7 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
     }
     for p in pulls {
         if p.stale || (p.moved && opts.prefer_remote) {
-            adopt_remote(&mut ctx, &p.branch, &p.parent_ref)?;
+            adopt_remote(&mut ctx, &p.branch, &p.parent_ref, &p.below)?;
         } else if p.moved {
             ui::warn(&format!(
                 "{} changed both locally and on {} — keeping local (use --prefer-remote to take theirs)",
@@ -1828,7 +1879,10 @@ pub fn submit(draft: bool, no_verify: bool, relink: bool, skip_conflicts: bool) 
             }
             Some(_) => {}
             None => {
-                let meta = git::commit_meta(ctx.refs.head(&b.branch).unwrap())?;
+                // With several commits, the first one says what the branch is for.
+                let tip = ctx.refs.head(&b.branch).unwrap();
+                let own = git::own_commits(tip, &below_heads(&ctx, &stack, idx))?;
+                let meta = git::commit_meta(own.first().map_or(tip, String::as_str))?;
                 let (title, body) = meta.message.split_once('\n').unwrap_or((&meta.message, ""));
                 batch.create_pr(&format!("c{idx}"), &repo_id, parent, &b.branch, title.trim(), body.trim(), draft);
                 created.push(idx);
@@ -2454,12 +2508,11 @@ pub fn history_revert(
     if point.sha == h.tip {
         bail!("{} is already {branch}'s tip; nothing to revert", point.label);
     }
-    let own = git::own_commits(&h.tip, &at.below)?;
-    if own.len() != 1 {
-        bail!("{branch} has {} commits of its own; gt needs exactly one (see `gt squash`)", own.len());
+    if git::own_commits(&h.tip, &at.below)?.is_empty() {
+        bail!("{branch} has no commit of its own to revert");
     }
     let paths = history::repo_relative(&paths, &ctx.info.toplevel)?;
-    let (new, mode) = h.plan_revert(&point, &paths, exact)?;
+    let history::Revert { new, mode } = h.plan_revert(&point, &paths, exact)?;
 
     let scope = match paths.len() {
         0 => branch.clone(),

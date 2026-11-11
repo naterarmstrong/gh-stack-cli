@@ -204,6 +204,23 @@ fn sync_takes_a_teammates_push_when_local_is_unedited() {
 }
 
 #[test]
+fn sync_takes_a_push_onto_a_multi_commit_branch_as_it_is() {
+    let w = submitted();
+    w.gt_ok(&["bottom"]);
+    w.write("a.rs", "second\n");
+    w.gt_ok(&["modify", "-a", "--new-commit", "-m", "Second"]);
+    w.gt_ok(&["submit"]);
+    let theirs = w.teammate_push("feat-a", "a.rs", "fixed by bot\n", false);
+
+    let out = w.gt_ok(&["sync"]);
+    assert!(out.stderr.contains("pulled remote changes into feat-a"), "{out:?}");
+    // Their commit lands on top of ours, unfolded.
+    assert_eq!(w.head("feat-a").unwrap(), theirs);
+    assert_eq!(w.count("main..feat-a"), 3);
+    assert_eq!(w.parent("feat-b"), theirs);
+}
+
+#[test]
 fn sync_keeps_local_when_both_sides_changed() {
     let w = submitted();
     w.teammate_push("feat-a", "a.rs", "theirs\n", true);
