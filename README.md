@@ -153,7 +153,7 @@ The Reviewing section of `gt log` and `gt ls` draws each reviewed stack on its o
 ### Following your cloud agents' PRs
 
 ```sh
-gt cloud             # pick from your open PRs that have no local branch, stacks grouped first
+gt cloud             # pick from your open PRs that have no local branch, stacks grouped first, each with when it was opened
 gt cloud 1234        # or by PR number, URL or branch name
 ```
 

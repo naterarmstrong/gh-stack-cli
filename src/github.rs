@@ -113,10 +113,38 @@ pub struct ReviewPr {
     pub additions: u64,
     pub deletions: u64,
     pub author: Option<Login>,
+    /// When the PR was opened, as GitHub's `2024-05-01T12:00:00Z`.
+    #[serde(default)]
+    pub created_at: String,
 }
 
-const REVIEW_FIELDS: &str =
-    "number title state isDraft headRefName baseRefName isCrossRepository additions deletions author { login }";
+impl ReviewPr {
+    pub fn opened(&self) -> Option<std::time::SystemTime> {
+        parse_timestamp(&self.created_at)
+    }
+}
+
+const REVIEW_FIELDS: &str = "number title state isDraft headRefName baseRefName isCrossRepository additions deletions author { login } createdAt";
+
+/// Parses a UTC `YYYY-MM-DDTHH:MM:SSZ` timestamp.
+fn parse_timestamp(s: &str) -> Option<std::time::SystemTime> {
+    let b = s.as_bytes();
+    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[19] != b'Z' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, min, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    // Days since 1970-01-01, from Howard Hinnant's days_from_civil.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days * 86400 + h * 3600 + min * 60 + sec;
+    Some(std::time::UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).ok()?))
+}
 
 pub enum PrQuery {
     Number(u64),

@@ -261,6 +261,7 @@ impl State {
             "additions": 10,
             "deletions": 2,
             "author": { "login": p.author },
+            "createdAt": "2024-05-01T12:00:00Z",
             "commits": { "nodes": [ { "commit": { "statusCheckRollup": p.checks.as_ref().map(|c| json!({ "state": c })) } } ] },
         })
     }
