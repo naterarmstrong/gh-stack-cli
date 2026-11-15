@@ -1,4 +1,4 @@
-//! `gt review` and `gt cloud`: pulling down PRs read-only, and how sync and ls treat them.
+//! `gt review` and `gt cloud`: pulling down PRs read-only or tracked, and how sync and ls treat them.
 
 mod common;
 
@@ -222,47 +222,73 @@ fn cloud_checks_a_fork_pr_against_its_pr_branch() {
 }
 
 #[test]
-fn cloud_pulls_down_drafts_on_both_sides_of_a_pr() {
+fn cloud_tracks_the_prs_a_pr_chains_to_drafts_included() {
     let w = World::with_github();
-    let r1 = their_pr(&w, "r1", "main", "r1.rs");
+    their_pr(&w, "r1", "main", "r1.rs");
     let r2 = their_pr(&w, "r2", "r1", "r2.rs");
     let r3 = their_pr(&w, "r3", "r2", "r3.rs");
     let r4 = their_pr(&w, "r4", "r3", "r4.rs");
-    let r5 = their_pr(&w, "r5", "r4", "r5.rs");
+    their_pr(&w, "r5", "r4", "r5.rs");
     for n in [r2, r4] {
         w.gh().update(n, |p| p.draft = true);
     }
 
     let out = w.gt_ok(&["cloud", &r3.to_string()]);
-    for n in [r1, r2, r4, r5] {
-        assert!(out.stderr.contains(&format!("also pulling down #{n}")), "{out:?}");
-    }
+    assert!(out.stderr.contains("tracked 5 branch(es) on main"), "{out:?}");
     assert_eq!(w.current(), "r3");
+    assert_eq!(w.stacks(), vec![vec!["r1", "r2", "r3", "r4", "r5"]]);
     for b in ["r1", "r2", "r3", "r4", "r5"] {
-        assert!(w.head(b).is_some(), "{b} pulled down");
-        assert!(w.config(&format!("branch.{b}.gtReview")).is_some());
+        assert!(w.config(&format!("branch.{b}.gtReview")).is_none(), "{b} isn't a review branch");
     }
 }
 
 #[test]
-fn cloud_leaves_the_same_state_as_review_and_syncs_agent_pushes() {
+fn cloud_stops_above_a_pr_where_the_stack_forks() {
+    let w = World::with_github();
+    let base = their_pr(&w, "base", "main", "b.rs");
+    let x = their_pr(&w, "x", "base", "x.rs");
+    let y = their_pr(&w, "y", "base", "y.rs");
+
+    let out = w.gt_ok(&["cloud", &base.to_string()]);
+    assert!(out.stderr.contains(&format!("not tracking #{x}, #{y}")), "{out:?}");
+    assert_eq!(w.stacks(), vec![vec!["base"]]);
+}
+
+#[test]
+fn cloud_tracks_a_lone_pr_and_syncs_agent_pushes() {
     let w = World::with_github();
     let n = their_pr(&w, "agent-work", "main", "a.rs");
     w.gh().update(n, |p| p.author = "me".into());
+    // Pulled down read-only before; tracking it drops that.
+    w.gt_ok(&["review", &n.to_string()]);
+    assert!(w.config("branch.agent-work.gtReview").is_some());
 
     w.gt_ok(&["cloud", &n.to_string()]);
     assert_eq!(w.current(), "agent-work");
-    assert_eq!(w.config("branch.agent-work.gtReview").as_deref(), Some("1"));
-    assert_eq!(w.config("branch.agent-work.gtReviewBase").as_deref(), Some("main"));
-    assert_eq!(w.config("branch.agent-work.github-pr-owner-number").as_deref(), Some("acme#widgets#1"));
-    assert!(!w.state_path().exists() || w.stacks().is_empty(), "cloud branches aren't stacked");
-    assert!(w.gt_ok(&["ls"]).stdout.contains("Reviewing"));
+    assert_eq!(w.stacks(), vec![vec!["agent-work"]]);
+    assert_eq!(w.config("branch.agent-work.gtReview"), None);
+    assert_eq!(w.config("branch.agent-work.gtReviewBase"), None);
+    assert!(!w.gt_ok(&["ls"]).stdout.contains("Reviewing"));
 
     let pushed = w.teammate_push("agent-work", "a.rs", "rewritten\n", true);
     w.gt_ok(&["sync"]);
     assert_eq!(w.head("agent-work").as_deref(), Some(pushed.as_str()));
 
-    w.merge_pr(n);
-    w.gt_ok(&["sync"]);
-    assert_eq!(w.head("agent-work"), None);
+    w.write("a.rs", "mine\n");
+    w.gt_ok(&["modify", "-a"]);
+    w.gt_ok(&["submit"]);
+    assert_eq!(w.show("origin/agent-work", "a.rs").as_deref(), Some("mine\n"));
+    assert_eq!(w.gh().prs().len(), 1, "reused the existing PR");
+}
+
+#[test]
+fn cloud_wont_track_a_fork_pr() {
+    let w = World::with_github();
+    let n = w.gh().add_pr(FakePr::new("fork-work", "main"));
+    w.gh().update(n, |p| {
+        p.author = "me".into();
+        p.cross_repo = true;
+    });
+    let out = w.gt_err(&["cloud", &n.to_string()]);
+    assert!(out.stderr.contains("is from a fork"), "{out:?}");
 }

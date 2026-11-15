@@ -163,8 +163,8 @@ enum Cmd {
         /// Branch name, PR number, or PR URL
         target: Option<String>,
     },
-    /// Check out a PR of yours that a cloud agent keeps updating, as `gt review` does, except
-    /// that drafts in its stack come down too.
+    /// Track a PR of yours that a cloud agent keeps updating, as `gt get` does. A PR GitHub
+    /// doesn't stack is tracked with the PRs its base chains it to, drafts included.
     /// Without a target, pick from your open PRs that have no local branch.
     Cloud {
         /// Branch name, PR number, or PR URL

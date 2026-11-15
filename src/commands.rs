@@ -1998,10 +1998,18 @@ pub fn get(target: String) -> Result<()> {
             r.into_iter().flatten().next().ok_or_else(|| anyhow!("no PR for branch {target}"))?.number
         }
     };
+    track_pr(&mut ctx, number, false)
+}
+
+/// Tracks PR `number` and the rest of its GitHub stack, then checks it out.
+/// A PR GitHub doesn't stack is tracked alone on its base, or, with `chain`,
+/// along with the PRs it sits on down to trunk and the one PR at a time
+/// stacked on top of it.
+fn track_pr(ctx: &mut Ctx, number: u64, chain: bool) -> Result<()> {
     if let Some((si, bi)) = ctx.store.file.find_pr(number) {
         let b = ctx.store.file.stacks[si].branches[bi].branch.clone();
         ui::info(&format!("#{number} is already tracked; checking out {b} (run `gt sync` to update)"));
-        return checkout(&ctx, &b);
+        return checkout(ctx, &b);
     }
 
     let gh = ctx.gh()?;
@@ -2014,6 +2022,10 @@ pub fn get(target: String) -> Result<()> {
                 r.number,
                 r.id.to_string(),
             ),
+            None if chain => {
+                let (trunk, entries) = pr_chain(ctx, number)?;
+                (trunk, entries, 0, String::new())
+            }
             None => {
                 let (_, r) = gh.prs(&[PrQuery::Number(number)])?;
                 let pr = r.into_iter().flatten().next().ok_or_else(|| anyhow!("PR #{number} not found"))?;
@@ -2028,12 +2040,16 @@ pub fn get(target: String) -> Result<()> {
 
     let mut to_fetch: Vec<String> = entries.iter().filter(|e| !e.2).map(|e| e.1.clone()).collect();
     to_fetch.push(trunk.clone());
-    fetch(&ctx, &to_fetch)?;
+    fetch(ctx, &to_fetch)?;
     ctx.reload()?;
 
     let mut branches = vec![];
     for (n, head, merged) in &entries {
         if !merged {
+            // A branch `gt review` or an older `gt cloud` pulled down stops being read-only.
+            for key in [review_key(head), review_base_key(head)] {
+                let _ = git::run_raw(None, &["config", "--unset", &key], None, &[]);
+            }
             let remote = ctx.refs.remote.get(head).cloned().ok_or_else(|| anyhow!("{head} missing after fetch"))?;
             let at_remote = match ctx.refs.head(head).map(str::to_string) {
                 None => ctx.set_branch(head, None, &remote, "gt get").map(|_| true)?,
@@ -2064,12 +2080,53 @@ pub fn get(target: String) -> Result<()> {
         ..Default::default()
     });
     ctx.reload()?;
-    restack::record_heads(&mut ctx);
+    restack::record_heads(ctx);
     ctx.save()?;
     ctx.ensure_upstreams(ctx.all_branches().iter().map(String::as_str));
     let target_branch = entries.iter().find(|e| e.0 == number).map(|e| e.1.clone()).unwrap();
     ui::ok(&format!("tracked {} branch(es) on {trunk}", entries.len()));
-    checkout(&ctx, &target_branch)
+    checkout(ctx, &target_branch)
+}
+
+/// The stack PR `number` forms through its PRs' bases, as `track_pr` takes it:
+/// the PRs below it, walking down to trunk or a PR that's closed or from a fork,
+/// then those above it while exactly one open PR sits on the last. Drafts are
+/// taken, since cloud agents leave their work in draft.
+fn pr_chain(ctx: &Ctx, number: u64) -> Result<(String, Vec<(u64, String, bool)>)> {
+    let gh = ctx.gh()?;
+    let pr = gh.review_pr(&PrQuery::Number(number))?.ok_or_else(|| anyhow!("PR #{number} not found"))?;
+    if pr.is_cross_repository {
+        bail!("#{number} is from a fork, so it can't be tracked; use `gt review {number}` to check it out read-only");
+    }
+    let trunk = ctx.default_trunk();
+    let mut seen = HashSet::from([pr.head_ref_name.clone()]);
+    let mut entries = vec![(number, pr.head_ref_name.clone(), pr.state == "MERGED")];
+    let mut base = pr.base_ref_name.clone();
+    while base != trunk && seen.insert(base.clone()) {
+        let Some(p) = gh.review_pr(&PrQuery::Head(base.clone()))? else { break };
+        if !matches!(p.state.as_str(), "OPEN" | "MERGED") || p.is_cross_repository {
+            break;
+        }
+        entries.insert(0, (p.number, p.head_ref_name.clone(), p.state == "MERGED"));
+        base = p.base_ref_name;
+    }
+    let mut top = pr.head_ref_name;
+    loop {
+        let above: Vec<ReviewPr> = gh
+            .review_prs_on(&top)?
+            .into_iter()
+            .filter(|p| p.state == "OPEN" && !p.is_cross_repository && !seen.contains(&p.head_ref_name))
+            .collect();
+        if above.len() > 1 {
+            let nums: Vec<String> = above.iter().map(|p| format!("#{}", p.number)).collect();
+            ui::info(&format!("not tracking {}: they all sit on {}", nums.join(", "), ui::bold(&top)));
+        }
+        let [p] = above.as_slice() else { break };
+        seen.insert(p.head_ref_name.clone());
+        entries.push((p.number, p.head_ref_name.clone(), false));
+        top = p.head_ref_name.clone();
+    }
+    Ok((base, entries))
 }
 
 // ───────────────────────────── open ─────────────────────────────
@@ -2186,27 +2243,38 @@ pub fn review(target: Option<String>) -> Result<()> {
         }
         Some(t) => find_review(&ctx, t)?,
     };
-    pull_down(&mut ctx, pr, head, false)
+    pull_down(&mut ctx, pr, head)
 }
 
-/// `gt review` for your own PRs that cloud agents work on: the same read-only
-/// review branch, picked from those you don't have locally yet. Agents leave
-/// work in draft, so drafts in the stack come down too.
+/// `gt get` for your own PRs that cloud agents work on, picked from those you
+/// don't have locally yet. A PR GitHub doesn't stack is tracked with the PRs
+/// its base chains it to, drafts included, or alone if there are none.
 pub fn cloud(target: Option<String>) -> Result<()> {
-    let mut ctx = Ctx::new(false)?;
-    let (pr, head) = match target {
-        None => {
-            let mut prs = ctx.gh()?.authored_prs()?;
-            prs.retain(|p| ctx.refs.head(&review_branch(p)).is_none());
-            if prs.is_empty() {
-                println!("All your open PRs already have local branches.");
-                return Ok(());
+    let number = {
+        let ctx = Ctx::new(false)?;
+        match target {
+            None => {
+                let mut prs = ctx.gh()?.authored_prs()?;
+                prs.retain(|p| ctx.refs.head(&review_branch(p)).is_none());
+                if prs.is_empty() {
+                    println!("All your open PRs already have local branches.");
+                    return Ok(());
+                }
+                pick_review(&ctx, "Cloud PR", prs, true)?.0.unwrap().number
             }
-            pick_review(&ctx, "Cloud PR", prs, true)?
+            Some(t) => match parse_pr(&t) {
+                Some(n) => n,
+                None => {
+                    ctx.gh()?
+                        .review_pr(&PrQuery::Head(t.clone()))?
+                        .ok_or_else(|| anyhow!("no PR for branch {t}"))?
+                        .number
+                }
+            },
         }
-        Some(t) => find_review(&ctx, t)?,
     };
-    pull_down(&mut ctx, pr, head, true)
+    let mut ctx = Ctx::new(true)?;
+    track_pr(&mut ctx, number, true)
 }
 
 /// Asks which of `prs` to pull down.
@@ -2237,7 +2305,7 @@ fn find_review(ctx: &Ctx, target: String) -> Result<(Option<ReviewPr>, String)> 
 }
 
 /// Pulls down a PR and the rest of its stack, then checks it out.
-fn pull_down(ctx: &mut Ctx, pr: Option<ReviewPr>, head: String, drafts: bool) -> Result<()> {
+fn pull_down(ctx: &mut Ctx, pr: Option<ReviewPr>, head: String) -> Result<()> {
     if let Some(p) = &pr {
         let author = p.author.as_ref().map(|a| format!(" by {}", a.login)).unwrap_or_default();
         ui::info(&format!("#{} {}{author}", p.number, ui::bold(&p.title)));
@@ -2247,7 +2315,7 @@ fn pull_down(ctx: &mut Ctx, pr: Option<ReviewPr>, head: String, drafts: bool) ->
     }
     let name = pull_review(ctx, pr.as_ref(), &head)?;
     if let Some(p) = &pr {
-        review_stack(ctx, p, drafts)?;
+        review_stack(ctx, p)?;
     }
     if let Some(wt) = ctx.other_worktree(&name) {
         ui::info(&format!("{name} is checked out in {}", wt.display()));
@@ -2259,8 +2327,8 @@ fn pull_down(ctx: &mut Ctx, pr: Option<ReviewPr>, head: String, drafts: bool) ->
 /// Pulls down the rest of a stacked PR's stack so it can be reviewed whole:
 /// the PRs it sits on, nearest parent first, then every PR stacked above it.
 /// Each walk stops at trunk or at a PR `pull_stacked` rejects, so a draft cuts
-/// off whatever is beyond it unless `drafts` lets the walks through them.
-fn review_stack(ctx: &mut Ctx, pr: &ReviewPr, drafts: bool) -> Result<()> {
+/// off whatever is beyond it.
+fn review_stack(ctx: &mut Ctx, pr: &ReviewPr) -> Result<()> {
     let trunk = ctx.default_trunk();
     let mut seen = HashSet::from([pr.head_ref_name.clone()]);
     let mut base = pr.base_ref_name.clone();
@@ -2268,7 +2336,7 @@ fn review_stack(ctx: &mut Ctx, pr: &ReviewPr, drafts: bool) -> Result<()> {
         let Some(p) = ctx.gh()?.review_pr(&PrQuery::Head(base.clone()))? else {
             break;
         };
-        if !pull_stacked(ctx, &p, drafts)? {
+        if !pull_stacked(ctx, &p)? {
             break;
         }
         base = p.base_ref_name.clone();
@@ -2276,7 +2344,7 @@ fn review_stack(ctx: &mut Ctx, pr: &ReviewPr, drafts: bool) -> Result<()> {
     let mut todo = vec![pr.head_ref_name.clone()];
     while let Some(head) = todo.pop() {
         for p in ctx.gh()?.review_prs_on(&head)? {
-            if seen.insert(p.head_ref_name.clone()) && pull_stacked(ctx, &p, drafts)? {
+            if seen.insert(p.head_ref_name.clone()) && pull_stacked(ctx, &p)? {
                 todo.push(p.head_ref_name.clone());
             }
         }
@@ -2286,10 +2354,10 @@ fn review_stack(ctx: &mut Ctx, pr: &ReviewPr, drafts: bool) -> Result<()> {
 
 /// Pulls down one PR from the reviewed PR's stack, or says why it won't.
 /// Returns whether it did, i.e. whether to keep walking past it.
-fn pull_stacked(ctx: &mut Ctx, p: &ReviewPr, drafts: bool) -> Result<bool> {
+fn pull_stacked(ctx: &mut Ctx, p: &ReviewPr) -> Result<bool> {
     let why = if p.state != "OPEN" {
         Some(format!("is {}", p.state.to_lowercase()))
-    } else if p.is_draft && !drafts {
+    } else if p.is_draft {
         Some("is a draft".to_string())
     } else if p.is_cross_repository {
         Some("is from a fork".to_string())

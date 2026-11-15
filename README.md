@@ -157,7 +157,7 @@ gt cloud             # pick from your open PRs that have no local branch, stacks
 gt cloud 1234        # or by PR number, URL or branch name
 ```
 
-`gt cloud` is `gt review` for PRs you authored that a cloud agent opened and keeps updating. It leaves the same state: a read-only review branch in the Reviewing section of `gt log` and `gt ls`, which `gt sync` moves to the PR head and deletes once the PR merges. Two things differ. The list is your own PRs, and a PR drops off it once it has a local branch, so it won't reappear after you've pulled it down. And the walks through the PR's stack don't stop at drafts, since agents often leave their work in draft.
+`gt cloud` is `gt get` for PRs you authored that a cloud agent opened and keeps updating, so you can edit and submit them like any of your branches, and `gt sync` takes the agent's pushes while you haven't changed the branch. The list is your own PRs, and a PR drops off it once it has a local branch, so it won't reappear after you've pulled it down. A PR in a GitHub stack brings that stack, as `gt get` does. Any other PR is tracked even though GitHub doesn't stack it: alone on trunk, or with the PRs its base chains it to. That's the PRs below it down to trunk, then the PRs above it as long as exactly one sits on the last, drafts included, since agents often leave their work in draft. It won't track a PR from a fork; `gt review` checks one out read-only. A branch you'd already pulled down with `gt review` stops being a review branch.
 
 ## How `gt loc` classifies files
 
