@@ -52,10 +52,17 @@ pub fn run_raw(dir: Option<&Path>, args: &[&str], stdin: Option<&str>, env: &[(&
     c.stdout(Stdio::piped()).stderr(Stdio::piped());
     c.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
     let mut child = c.spawn().context("spawning git")?;
-    if let Some(input) = stdin {
-        child.stdin.take().unwrap().write_all(input.as_bytes())?;
-    }
+    // Written from another thread while the output is read, or git blocks on a
+    // full stdout pipe while we block writing stdin it has stopped reading.
+    let writer = stdin.map(|input| {
+        let mut pipe = child.stdin.take().unwrap();
+        let input = input.to_owned();
+        std::thread::spawn(move || pipe.write_all(input.as_bytes()))
+    });
     let out = child.wait_with_output()?;
+    if let Some(w) = writer {
+        w.join().expect("stdin writer")?;
+    }
     Ok(Output {
         ok: out.status.success(),
         code: out.status.code().unwrap_or(-1),
@@ -374,4 +381,18 @@ pub fn remote_urls(remote: &str) -> Vec<String> {
     let raw = run(&["config", "--get", &format!("remote.{remote}.url")]).ok();
     let expanded = run(&["remote", "get-url", remote]).ok();
     raw.into_iter().chain(expanded).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_raw_reads_output_bigger_than_a_pipe_while_writing_stdin() {
+        // Far more than the ~64 KB a pipe holds, both ways.
+        let paths: String = (0..20_000).map(|i| format!("some/dir/file_{i}.rs\0")).collect();
+        let out = run_raw(None, &["check-attr", "-z", "--stdin", "linguist-generated"], Some(&paths), &[]).unwrap();
+        assert!(out.ok, "{}", out.stderr);
+        assert!(out.stdout.len() > 256 * 1024);
+    }
 }
