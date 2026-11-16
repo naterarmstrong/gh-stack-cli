@@ -2186,8 +2186,7 @@ fn review_groups<'a>(prs: &'a [ReviewPr], trunk: &str) -> (Vec<Vec<&'a ReviewPr>
 }
 
 /// Picker rows for `gt review`: each stack above its base branch, then the other PRs.
-/// `opened` adds when each PR was opened.
-fn review_items(prs: &[ReviewPr], trunk: &str, opened: bool) -> Vec<picker::Item> {
+fn review_items(prs: &[ReviewPr], trunk: &str) -> Vec<picker::Item> {
     let num_w = prs.iter().map(|p| p.number.to_string().len()).max().unwrap_or(0) + 1;
     let line = |p: &ReviewPr, marker: &str| {
         let title: String = p.title.chars().take(70).collect();
@@ -2201,7 +2200,7 @@ fn review_items(prs: &[ReviewPr], trunk: &str, opened: bool) -> Vec<picker::Item
         if p.is_draft {
             badges.push(ui::dim("draft"));
         }
-        if let Some(t) = p.opened().filter(|_| opened) {
+        if let Some(t) = p.opened() {
             badges.push(ui::dim(&format!("opened {}", ui::ago(t))));
         }
         picker::Item {
@@ -2243,7 +2242,7 @@ pub fn review(target: Option<String>) -> Result<()> {
                 outln!("No open PRs are waiting on your review.");
                 return Ok(());
             }
-            pick_review(&ctx, "Review", prs, false)?
+            pick_review(&ctx, "Review", prs)?
         }
         Some(t) => find_review(&ctx, t)?,
     };
@@ -2264,7 +2263,7 @@ pub fn cloud(target: Option<String>) -> Result<()> {
                     outln!("All your open PRs already have local branches.");
                     return Ok(());
                 }
-                pick_review(&ctx, "Cloud PR", prs, true)?.0.unwrap().number
+                pick_review(&ctx, "Cloud PR", prs)?.0.unwrap().number
             }
             Some(t) => match parse_pr(&t) {
                 Some(n) => n,
@@ -2282,8 +2281,8 @@ pub fn cloud(target: Option<String>) -> Result<()> {
 }
 
 /// Asks which of `prs` to pull down.
-fn pick_review(ctx: &Ctx, prompt: &str, prs: Vec<ReviewPr>, opened: bool) -> Result<(Option<ReviewPr>, String)> {
-    let items = review_items(&prs, &ctx.default_trunk(), opened);
+fn pick_review(ctx: &Ctx, prompt: &str, prs: Vec<ReviewPr>) -> Result<(Option<ReviewPr>, String)> {
+    let items = review_items(&prs, &ctx.default_trunk());
     let picked = picker::pick(prompt, &items, None)?.ok_or_else(|| anyhow!("cancelled"))?;
     let n: u64 = picked.split('\t').next().unwrap().parse()?;
     let pr = prs.into_iter().find(|p| p.number == n).unwrap();
@@ -2697,15 +2696,14 @@ mod tests {
     }
 
     #[test]
-    fn cloud_rows_say_when_each_pr_was_opened() {
+    fn picker_rows_say_when_each_pr_was_opened() {
         let mut p = pr(1, "a", "main");
         p.created_at = "2020-02-29T00:00:00Z".into();
         assert_eq!(p.opened(), Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_582_934_400)));
-        let text = |p: &ReviewPr, opened| review_items(std::slice::from_ref(p), "main", opened)[0].text.clone();
-        assert!(text(&p, true).contains("opened ") && text(&p, true).contains("d ago"), "{}", text(&p, true));
-        assert!(!text(&p, false).contains("opened"));
+        let text = |p: &ReviewPr| review_items(std::slice::from_ref(p), "main")[0].text.clone();
+        assert!(text(&p).contains("opened ") && text(&p).contains("d ago"), "{}", text(&p));
         p.created_at = "not a date".into();
         assert!(p.opened().is_none());
-        assert!(!text(&p, true).contains("opened"));
+        assert!(!text(&p).contains("opened"));
     }
 }

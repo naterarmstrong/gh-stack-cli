@@ -138,7 +138,7 @@ Each `.git/gt-stack` entry is either a whole stack on a trunk, or local branches
 ### Reviewing others' PRs
 
 ```sh
-gt review            # pick from PRs where you're a requested reviewer (directly, not via a team), stacks grouped first
+gt review            # pick from PRs where you're a requested reviewer (directly, not via a team), stacks grouped first, each with when it was opened
 gt review 1234       # or by PR number, URL or branch name
 ```
 
