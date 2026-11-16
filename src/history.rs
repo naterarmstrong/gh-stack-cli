@@ -25,6 +25,7 @@
 
 use crate::git::{self, Merge};
 use crate::loc;
+use crate::outln;
 use crate::ui;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -1041,8 +1042,8 @@ pub fn render(h: &History) {
     if uniform {
         title.push_str(&format!("  {}", h.versions[0].subject));
     }
-    println!("{title}");
-    println!("{}", ui::dim("  PATCH  SHA       WHEN      ACTION   REMOTE     Δ VS PREVIOUS"));
+    outln!("{title}");
+    outln!("{}", ui::dim("  PATCH  SHA       WHEN      ACTION   REMOTE     Δ VS PREVIOUS"));
 
     for v in h.versions.iter().rev() {
         let label = format!("{}{}", v.label(), if v.current { "*" } else { "" });
@@ -1069,7 +1070,7 @@ pub fn render(h: &History) {
             }
         };
         let when = when(v.time);
-        println!(
+        outln!(
             "  {} {} {} {} {} {delta}",
             pad(&label, colored_label, 6),
             pad(ui::short(&v.sha), ui::yellow(ui::short(&v.sha)), 9),
@@ -1079,17 +1080,17 @@ pub fn render(h: &History) {
         );
         print_details(v, uniform);
     }
-    println!();
-    println!("{}", ui::dim("* = current tip. Remote marks are this clone's view: what it pushed, or saw in a fetch."));
+    outln!();
+    outln!("{}", ui::dim("* = current tip. Remote marks are this clone's view: what it pushed, or saw in a fetch."));
 }
 
 fn print_details(v: &Version, uniform: bool) {
     let indent = "         ";
     if !uniform {
-        println!("{indent}{}", ui::dim(&v.subject));
+        outln!("{indent}{}", ui::dim(&v.subject));
     }
     if !v.tip {
-        println!("{indent}{}", ui::dim("↳ passed through: arrived under a later commit, never the tip here"));
+        outln!("{indent}{}", ui::dim("↳ passed through: arrived under a later commit, never the tip here"));
     }
     if let Some(d) = v.delta.as_ref().filter(|d| !d.conflict) {
         let (gen_files, mut files): (Vec<&loc::FileStat>, Vec<&loc::FileStat>) =
@@ -1097,20 +1098,20 @@ fn print_details(v: &Version, uniform: bool) {
         files.sort_by_key(|f| std::cmp::Reverse(f.lines.sum().add + f.lines.sum().del));
         for f in files.iter().take(3) {
             let (_, size) = loc::counts(&f.lines.sum());
-            println!("{indent}{} {} {size}", ui::dim("±"), ui::dim(&f.path));
+            outln!("{indent}{} {} {size}", ui::dim("±"), ui::dim(&f.path));
         }
         if files.len() > 3 {
-            println!("{indent}{}", ui::dim(&format!("  … {} more", files.len() - 3)));
+            outln!("{indent}{}", ui::dim(&format!("  … {} more", files.len() - 3)));
         }
         if !gen_files.is_empty() {
             let n = gen_files.len();
-            println!("{indent}{}", ui::dim(&format!("⊘ {n} generated file{}", if n == 1 { "" } else { "s" })));
+            outln!("{indent}{}", ui::dim(&format!("⊘ {n} generated file{}", if n == 1 { "" } else { "s" })));
         }
     }
     let shas = v.shas();
     if shas.len() > 1 {
         let prior: Vec<&str> = shas[..shas.len() - 1].iter().map(|s| ui::short(s)).collect();
-        println!("{indent}{}", ui::dim(&format!("↺ {}", prior.join(" "))));
+        outln!("{indent}{}", ui::dim(&format!("↺ {}", prior.join(" "))));
     }
 }
 

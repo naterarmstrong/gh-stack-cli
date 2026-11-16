@@ -27,6 +27,25 @@ pub fn parse_remote(url: &str) -> Option<(String, String, String)> {
     Some((host, parts.next()?.to_string(), parts.next()?.to_string()))
 }
 
+/// Records a GitHub call in the journal: what it was, its status and time. Never headers or bodies.
+fn log_call(op: &str, resp: &Result<ureq::Response, ureq::Error>, started: std::time::Instant) {
+    let status = match resp {
+        Ok(r) => json!(r.status()),
+        Err(ureq::Error::Status(code, _)) => json!(code),
+        Err(e) => json!(e.kind().to_string()),
+    };
+    crate::journal::event("gh", json!({ "op": op, "status": status, "ms": crate::journal::ms(started) }));
+}
+
+/// The start of a GraphQL document on one line, enough to tell which query it was.
+fn gql_label(query: &str) -> String {
+    let flat = query.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(120) {
+        Some((i, _)) => format!("{}… ({} chars)", &flat[..i], flat.len()),
+        None => flat,
+    }
+}
+
 fn token(host: &str) -> Result<String> {
     for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(t) = std::env::var(var) {
@@ -182,10 +201,12 @@ impl Client {
     /// Returns Ok(None) on 404 / 204.
     pub fn rest(&self, method: &str, path: &str, body: Option<Value>) -> Result<Option<Value>> {
         let req = self.request(method, path);
+        let started = std::time::Instant::now();
         let resp = match body {
             Some(b) => req.send_json(b),
             None => req.call(),
         };
+        log_call(&format!("{method} {path}"), &resp, started);
         match resp {
             Ok(r) if r.status() == 204 => Ok(None),
             Ok(r) => Ok(Some(r.into_json()?)),
@@ -200,7 +221,10 @@ impl Client {
 
     pub fn graphql(&self, query: &str) -> Result<Value> {
         let gql_path = if self.host == "github.com" { "graphql".to_string() } else { "../graphql".to_string() };
-        let resp: Value = match self.request("POST", &gql_path).send_json(json!({ "query": query })) {
+        let started = std::time::Instant::now();
+        let resp = self.request("POST", &gql_path).send_json(json!({ "query": query }));
+        log_call(&format!("graphql {}", gql_label(query)), &resp, started);
+        let resp: Value = match resp {
             Ok(r) => r.into_json()?,
             Err(ureq::Error::Status(code, r)) => bail!("graphql HTTP {code}: {}", r.into_string().unwrap_or_default()),
             Err(e) => return Err(e.into()),

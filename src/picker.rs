@@ -166,6 +166,15 @@ pub fn pick(prompt: &str, items: &[Item], initial: Option<&str>) -> Result<Optio
     }
     clear += "\r\x1b[J";
     term.tty.write_all(clear.as_bytes())?;
+    crate::journal::event(
+        "pick",
+        serde_json::json!({
+            "prompt": prompt,
+            "items": items.iter().filter(|i| i.key.is_some()).count(),
+            "filter": query,
+            "picked": result,
+        }),
+    );
     Ok(result)
 }
 
@@ -180,5 +189,7 @@ pub fn confirm(question: &str) -> Result<bool> {
     tty.flush()?;
     let mut line = String::new();
     std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut tty), &mut line)?;
-    Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
+    let yes = matches!(line.trim().to_lowercase().as_str(), "y" | "yes");
+    crate::journal::event("confirm", serde_json::json!({ "question": question, "yes": yes }));
+    Ok(yes)
 }

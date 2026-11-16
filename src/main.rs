@@ -3,6 +3,7 @@ mod ctx;
 mod git;
 mod github;
 mod history;
+mod journal;
 mod loc;
 mod picker;
 mod restack;
@@ -237,7 +238,16 @@ enum HistoryCmd {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    journal::start();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // --help and --version land here too, with code 0.
+            let code = e.exit_code();
+            journal::end(code, (code != 0).then(|| e.kind().to_string()).as_deref());
+            e.exit()
+        }
+    };
     let res = match cli.cmd {
         Cmd::Log { stack } => commands::log(stack, false),
         Cmd::Ls { stack } => commands::log(stack, true),
@@ -280,6 +290,8 @@ fn main() {
     };
     if let Err(e) = res {
         eprintln!("{} {e:#}", ui::red("error:"));
+        journal::end(1, Some(&format!("{e:#}")));
         std::process::exit(1);
     }
+    journal::end(0, None);
 }

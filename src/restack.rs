@@ -6,6 +6,7 @@
 //! from the parent of its oldest commit that isn't below it.
 
 use crate::ctx::Ctx;
+use crate::errln;
 use crate::git::{self, Merge};
 use crate::ui;
 use anyhow::{Result, bail};
@@ -300,7 +301,7 @@ fn start_conflict(ctx: &mut Ctx, c: &Conflict) -> Result<()> {
     ));
     let rebase_cmd = format!("git rebase --onto {} {}", ui::short(&c.onto), ui::short(&c.base));
     if let Some(wt) = ctx.other_worktree(&c.branch) {
-        eprintln!(
+        errln!(
             "\n{} is checked out in {}. Resolve it there:\n    cd {} && {rebase_cmd}\nthen run `gt continue`.",
             c.branch,
             wt.display(),
@@ -309,7 +310,7 @@ fn start_conflict(ctx: &mut Ctx, c: &Conflict) -> Result<()> {
         return Ok(());
     }
     if !git::is_clean(None)? {
-        eprintln!(
+        errln!(
             "\nWorking tree is dirty. Commit or stash, then:\n    git checkout {} && {rebase_cmd}\nand run `gt continue`.",
             c.branch
         );
@@ -321,6 +322,6 @@ fn start_conflict(ctx: &mut Ctx, c: &Conflict) -> Result<()> {
         git::run(&["checkout", "--quiet", &c.branch])?;
     }
     git::run_raw(None, &["rebase", "--onto", &c.onto, &c.base], None, &[])?;
-    eprintln!("\nResolve the conflicts, `git add` them, then run `gt continue` (or `gt abort` to give up).");
+    errln!("\nResolve the conflicts, `git add` them, then run `gt continue` (or `gt abort` to give up).");
     Ok(())
 }

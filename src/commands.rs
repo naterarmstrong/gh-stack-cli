@@ -2,11 +2,13 @@ use crate::ctx::{Ctx, Review};
 use crate::git;
 use crate::github::{MutationBatch, Pr, PrQuery, ReviewPr};
 use crate::history;
+use crate::journal;
 use crate::loc;
 use crate::picker;
 use crate::restack;
 use crate::state::{BranchRef, PrRef, Stack};
 use crate::ui;
+use crate::{errln, outln};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
 
@@ -207,7 +209,7 @@ fn branch_line(ctx: &Ctx, stack: &Stack, idx: usize, prs: &HashMap<String, Pr>, 
 /// ```
 fn render_stacks(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bool) {
     for row in graph_rows(ctx, sis, prs, detail) {
-        println!("{}", row.text);
+        outln!("{}", row.text);
     }
 }
 
@@ -394,24 +396,24 @@ fn render_reviews(ctx: &Ctx, prs: &HashMap<String, Pr>, detail: bool) {
     };
     let base = |r: &Review| r.base.clone().or_else(|| Some(prs.get(&r.branch)?.base_ref_name.clone()));
     let (stacks, alone) = review_stacks(&ctx.reviews, base, &ctx.default_trunk());
-    println!("\n{}", ui::dim("Reviewing"));
+    outln!("\n{}", ui::dim("Reviewing"));
     for (n, (members, below)) in stacks.iter().enumerate() {
         if n > 0 {
-            println!();
+            outln!();
         }
         for r in members {
-            println!("{}", line(r));
+            outln!("{}", line(r));
         }
         let here = cur == Some(below.as_str());
         let name = if here { ui::bold(&ui::cyan(below)) } else { ui::dim(below) };
-        println!("{}  {name}", if here { ui::cyan("◉") } else { ui::dim("◯") });
+        outln!("{}  {name}", if here { ui::cyan("◉") } else { ui::dim("◯") });
     }
     if !alone.is_empty() {
         if !stacks.is_empty() {
-            println!();
+            outln!();
         }
         for r in alone {
-            println!("{}", line(r));
+            outln!("{}", line(r));
         }
     }
 }
@@ -559,12 +561,12 @@ pub fn loc_cmd(target: Option<String>, json: bool) -> Result<()> {
         let mut v = serde_json::to_value(&diff)?;
         v["version"] = 1.into();
         v["branch"] = branch.into();
-        println!("{}", serde_json::to_string(&v)?);
+        outln!("{}", serde_json::to_string(&v)?);
         return Ok(());
     }
     let (_, total) = loc::summary(&diff.total);
     let name = branch.unwrap_or_else(|| ui::short(&diff.commit).to_string());
-    println!("{}  {}", ui::bold(&name), if total.is_empty() { ui::dim("no changes") } else { total });
+    outln!("{}  {}", ui::bold(&name), if total.is_empty() { ui::dim("no changes") } else { total });
     let width = diff.files.iter().map(|f| f.path.chars().count()).max().unwrap_or(0);
     for f in &diff.files {
         let (_, size) = loc::summary(&f.lines);
@@ -572,7 +574,7 @@ pub fn loc_cmd(target: Option<String>, json: bool) -> Result<()> {
         let path = format!("{:width$}", f.path);
         let path = if f.kind == loc::Kind::Src { path } else { ui::dim(&path) };
         let from = f.old_path.as_ref().map(|o| ui::dim(&format!("  (from {o})"))).unwrap_or_default();
-        println!("  {} {path}  {size}{from}", ui::dim(&f.status));
+        outln!("  {} {path}  {size}{from}", ui::dim(&f.status));
     }
     Ok(())
 }
@@ -627,7 +629,7 @@ pub fn log(stack_only: bool, offline: bool) -> Result<()> {
     let show_reviews =
         !stack_only || ctx.info.current_branch.as_deref().is_none_or(|c| ctx.store.file.find(c).is_none());
     if sis.is_empty() && (!show_reviews || ctx.reviews.is_empty()) {
-        println!("No stacks. Start one with `gt create <name> -m <message>`.");
+        outln!("No stacks. Start one with `gt create <name> -m <message>`.");
         return Ok(());
     }
     let prs = if offline {
@@ -843,7 +845,7 @@ pub fn create(name: Option<String>, message: Option<String>, all: bool, base: Op
 
 fn exit_on_conflict(clean: bool) -> Result<()> {
     if !clean {
-        std::process::exit(1);
+        journal::exit(1);
     }
     Ok(())
 }
@@ -937,11 +939,13 @@ pub fn continue_cmd() -> Result<()> {
     // The branch the restack started from, to return to once the stack is done.
     let orig = std::fs::read_to_string(&note).ok().and_then(|s| s.lines().next().map(str::to_string));
     if git::rebase_in_progress(&git_dir) {
-        let ok = std::process::Command::new(git::git_bin())
+        let started = std::time::Instant::now();
+        let status = std::process::Command::new(git::git_bin())
             .args(["rebase", "--continue"])
             .env("GIT_EDITOR", "true")
-            .status()?
-            .success();
+            .status()?;
+        git::log_git(&["rebase", "--continue"], status.code().unwrap_or(-1), started, b"", None, None);
+        let ok = status.success();
         if !ok {
             bail!("rebase still has conflicts; resolve, `git add`, and run `gt continue` again (or `gt abort`)");
         }
@@ -958,7 +962,7 @@ pub fn continue_cmd() -> Result<()> {
             let rest: Vec<&str> = text.lines().skip(1).collect();
             std::fs::write(&note, format!("{o}\n{}\n", rest.join("\n")))?;
         }
-        std::process::exit(1);
+        journal::exit(1);
     }
     ui::ok("stack restacked");
     if let Some(o) = orig {
@@ -1058,14 +1062,14 @@ pub fn delete_upstack(target: Option<String>, force: bool) -> Result<()> {
 
     let local: Vec<(String, String)> =
         doomed.iter().filter_map(|b| ctx.refs.head(&b.branch).map(|h| (b.branch.clone(), h.to_string()))).collect();
-    eprintln!("Deleting {} local branch(es); remote branches and PRs stay as they are:", local.len());
+    errln!("Deleting {} local branch(es); remote branches and PRs stay as they are:", local.len());
     for (b, h) in local.iter().rev() {
         let note = match ctx.refs.remote.get(b) {
             None => ui::yellow("  never pushed"),
             Some(r) if r != h => ui::yellow("  has unpushed changes"),
             _ => String::new(),
         };
-        eprintln!("  {} {}{note}", ui::bold(b), ui::dim(ui::short(h)));
+        errln!("  {} {}{note}", ui::bold(b), ui::dim(ui::short(h)));
     }
     if !force && !picker::confirm("Delete them?")? {
         bail!("aborted; nothing deleted");
@@ -1535,13 +1539,13 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
     }
     render_stacks(&ctx, &live, &prs, true);
     if !skipped.is_empty() {
-        eprintln!(
+        errln!(
             "\n{} need a rebase. To resolve one: `gt checkout <branch> && gt restack --trunk`.",
             skipped.iter().map(|b| ui::bold(b)).collect::<Vec<_>>().join(", ")
         );
     }
     if !unpushed.is_empty() {
-        eprintln!(
+        errln!(
             "\n{} changed locally and aren't pushed; `gt submit` pushes them.",
             unpushed.iter().map(|b| ui::bold(b)).collect::<Vec<_>>().join(", ")
         );
@@ -1790,10 +1794,10 @@ pub fn clear_merged(force: bool, diverged: bool) -> Result<()> {
         restack::record_heads(&mut ctx);
         return ctx.save();
     }
-    eprintln!("Deleting {} merged local branch(es); remote branches stay as they are:", doomed.len());
+    errln!("Deleting {} merged local branch(es); remote branches stay as they are:", doomed.len());
     for (b, h, n, note) in &doomed {
         let note = note.as_ref().map(|n| format!("  {}", ui::yellow(n))).unwrap_or_default();
-        eprintln!("  {} {} {}{note}", ui::bold(b), ui::dim(ui::short(h)), ui::magenta(&format!("#{n} merged")));
+        errln!("  {} {} {}{note}", ui::bold(b), ui::dim(ui::short(h)), ui::magenta(&format!("#{n} merged")));
     }
     if !force && !picker::confirm("Delete them?")? {
         restack::record_heads(&mut ctx);
@@ -1847,7 +1851,7 @@ pub fn submit(draft: bool, no_verify: bool, relink: bool, skip_conflicts: bool) 
     }
     if stop.is_none() && !restack::run(&mut ctx, si, false)? {
         ctx.save()?;
-        std::process::exit(1);
+        journal::exit(1);
     }
     let in_scope = |i: usize| stop.is_none_or(|s| i < s);
 
@@ -1924,7 +1928,7 @@ pub fn submit(draft: bool, no_verify: bool, relink: bool, skip_conflicts: bool) 
     let stack = &ctx.store.file.stacks[si];
     for (_, b) in stack.shared().collect::<Vec<_>>().into_iter().rev() {
         if let Some(n) = b.pr_number() {
-            println!("{:<40} {}", b.branch, gh.pr_url(n));
+            outln!("{:<40} {}", b.branch, gh.pr_url(n));
         }
     }
     if let Some(b) = stop.and_then(|i| stack.branches.get(i)) {
@@ -2236,7 +2240,7 @@ pub fn review(target: Option<String>) -> Result<()> {
         None => {
             let prs = ctx.gh()?.review_requests()?;
             if prs.is_empty() {
-                println!("No open PRs are waiting on your review.");
+                outln!("No open PRs are waiting on your review.");
                 return Ok(());
             }
             pick_review(&ctx, "Review", prs, false)?
@@ -2257,7 +2261,7 @@ pub fn cloud(target: Option<String>) -> Result<()> {
                 let mut prs = ctx.gh()?.authored_prs()?;
                 prs.retain(|p| ctx.refs.head(&review_branch(p)).is_none());
                 if prs.is_empty() {
-                    println!("All your open PRs already have local branches.");
+                    outln!("All your open PRs already have local branches.");
                     return Ok(());
                 }
                 pick_review(&ctx, "Cloud PR", prs, true)?.0.unwrap().number
@@ -2469,7 +2473,7 @@ pub fn open(target: Option<String>) -> Result<()> {
 fn open_url(url: &str) -> Result<()> {
     let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
     std::process::Command::new(opener).arg(url).status()?;
-    println!("{url}");
+    outln!("{url}");
     Ok(())
 }
 
@@ -2513,7 +2517,7 @@ pub fn history_list(target: Option<String>, json: bool) -> Result<()> {
     let mut h = history::load(&ctx.info.common_dir, &ctx.remote, &branch, &at, true)?;
     if json {
         h.versions.reverse();
-        println!("{}", serde_json::to_string_pretty(&h)?);
+        outln!("{}", serde_json::to_string_pretty(&h)?);
         return Ok(());
     }
     history::render(&h);
@@ -2548,11 +2552,11 @@ pub fn history_compare(from: Option<String>, to: Option<String>, target: Option<
             "right_tree": git::tree_of(&right)?,
             "files": history::changed_files(&left, &right)?,
         });
-        println!("{}", serde_json::to_string_pretty(&v)?);
+        outln!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
-    println!("{}  {}", ui::bold(&branch), ui::dim(&format!("on {}", h.parent)));
-    println!(
+    outln!("{}  {}", ui::bold(&branch), ui::dim(&format!("on {}", h.parent)));
+    outln!(
         "{} ({}) → {} ({})\n",
         ui::cyan(&a.label),
         ui::yellow(ui::short(&a.sha)),
@@ -2592,11 +2596,11 @@ pub fn history_revert(
         n => format!("{n} paths on {branch}"),
     };
     ui::info(&format!("reverting {} to {} ({})", ui::bold(&scope), ui::cyan(&point.label), ui::short(&point.sha)));
-    eprintln!("  {}", ui::dim(&mode));
+    errln!("  {}", ui::dim(&mode));
     for line in git::run(&["diff", "--numstat", &h.tip, &new])?.lines() {
         let mut f = line.splitn(3, '\t');
         let (add, del, path) = (f.next().unwrap_or(""), f.next().unwrap_or(""), f.next().unwrap_or(""));
-        eprintln!("    {} {path} {}", ui::dim("±"), ui::dim(&format!("+{add} −{del}")));
+        errln!("    {} {path} {}", ui::dim("±"), ui::dim(&format!("+{add} −{del}")));
     }
     if !yes && !picker::confirm("Revert?")? {
         bail!("cancelled");
@@ -2619,7 +2623,7 @@ pub fn history_revert(
         }
         None => {}
     }
-    eprintln!("{}", ui::dim(&format!("Undo with `gt history revert {undo}`. Not pushed: `gt submit` updates the PR.")));
+    errln!("{}", ui::dim(&format!("Undo with `gt history revert {undo}`. Not pushed: `gt submit` updates the PR.")));
     exit_on_conflict(clean)
 }
 

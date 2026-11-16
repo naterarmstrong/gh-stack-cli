@@ -51,6 +51,7 @@ pub fn run_raw(dir: Option<&Path>, args: &[&str], stdin: Option<&str>, env: &[(&
     }
     c.stdout(Stdio::piped()).stderr(Stdio::piped());
     c.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+    let started = std::time::Instant::now();
     let mut child = c.spawn().context("spawning git")?;
     // Written from another thread while the output is read, or git blocks on a
     // full stdout pipe while we block writing stdin it has stopped reading.
@@ -63,6 +64,7 @@ pub fn run_raw(dir: Option<&Path>, args: &[&str], stdin: Option<&str>, env: &[(&
     if let Some(w) = writer {
         w.join().expect("stdin writer")?;
     }
+    log_git(args, out.status.code().unwrap_or(-1), started, &out.stderr, Some(out.stdout.len()), stdin.map(str::len));
     Ok(Output {
         ok: out.status.success(),
         code: out.status.code().unwrap_or(-1),
@@ -86,7 +88,38 @@ pub fn run_in(dir: Option<&Path>, args: &[&str]) -> Result<String> {
 
 /// Run git with the terminal attached (editors, hooks, progress output).
 pub fn run_interactive(dir: Option<&Path>, args: &[&str]) -> Result<bool> {
-    Ok(cmd(dir, args).status().context("spawning git")?.success())
+    let started = std::time::Instant::now();
+    let status = cmd(dir, args).status().context("spawning git")?;
+    log_git(args, status.code().unwrap_or(-1), started, b"", None, None);
+    Ok(status.success())
+}
+
+/// Records a git call in the journal: its args (the first 20), exit code,
+/// time, and stderr; stdout and stdin only by size.
+pub fn log_git(
+    args: &[&str],
+    code: i32,
+    started: std::time::Instant,
+    stderr: &[u8],
+    stdout_len: Option<usize>,
+    stdin_len: Option<usize>,
+) {
+    let mut f = serde_json::json!({ "code": code, "ms": crate::journal::ms(started) });
+    f["args"] = args.iter().take(20).copied().collect::<Vec<_>>().into();
+    if args.len() > 20 {
+        f["more_args"] = (args.len() - 20).into();
+    }
+    let stderr = String::from_utf8_lossy(stderr);
+    if !stderr.trim().is_empty() {
+        f["stderr"] = crate::journal::truncate(stderr.trim()).into();
+    }
+    if let Some(n) = stdout_len {
+        f["stdout_bytes"] = n.into();
+    }
+    if let Some(n) = stdin_len {
+        f["stdin_bytes"] = n.into();
+    }
+    crate::journal::event("git", f);
 }
 
 pub struct RepoInfo {
@@ -106,7 +139,7 @@ pub fn open() -> Result<gix::Repository> {
 
 pub fn repo_info(repo: &gix::Repository) -> Result<RepoInfo> {
     let abs = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    Ok(RepoInfo {
+    let info = RepoInfo {
         common_dir: abs(repo.common_dir()),
         git_dir: abs(repo.git_dir()),
         toplevel: abs(repo.workdir().ok_or_else(|| anyhow::anyhow!("bare repositories aren't supported"))?),
@@ -114,7 +147,9 @@ pub fn repo_info(repo: &gix::Repository) -> Result<RepoInfo> {
             .head_name()?
             .and_then(|n| n.as_bstr().to_string().strip_prefix("refs/heads/").map(str::to_string)),
         me: identities(repo),
-    })
+    };
+    crate::journal::repo(&info.toplevel, info.current_branch.as_deref());
+    Ok(info)
 }
 
 fn identities(repo: &gix::Repository) -> Vec<String> {

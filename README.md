@@ -170,6 +170,15 @@ Each changed file is counted as one of:
 
 `linguist-generated`, `linguist-vendored` and `linguist-documentation` attributes in `.gitattributes` take priority. Inside Rust files, `#[cfg(test)]` items count as test (this assumes rustfmt'd code). Because a commit's diff never changes, results are cached forever under `<git-common-dir>/gt/loc-v<N>/<sha>.json` and shared across worktrees.
 
+## Run log
+
+Every run appends to `~/.local/state/gt/log/<date>.jsonl` (`$XDG_STATE_HOME` is honored, and `GT_LOG_DIR` overrides the directory), one JSON object per line, all tagged with the run's id: the command line and directory, the repo and branch, each git call (args, exit code, time, stderr) and GitHub call (endpoint or query, status, time), each info/warning/error line, what was picked or confirmed, and how the run ended. Stdout is kept as a line count, a hash and its first 20 lines. A run with a `start` but no `end` was killed. Logs older than 14 days are deleted. `GT_LOG=0` turns it off.
+
+```sh
+jq -c 'select(.ev == "end" and .ms > 2000)' ~/.local/state/gt/log/*.jsonl   # slow runs
+jq -r 'select(.ev == "warn") | .msg' ~/.local/state/gt/log/*.jsonl | sort | uniq -c | sort -rn
+```
+
 ## Development
 
 ```sh
