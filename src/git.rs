@@ -51,6 +51,9 @@ pub fn run_raw(dir: Option<&Path>, args: &[&str], stdin: Option<&str>, env: &[(&
     }
     c.stdout(Stdio::piped()).stderr(Stdio::piped());
     c.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+    if args.first() == Some(&"fetch") {
+        *CHAINS.lock().unwrap() = None;
+    }
     let started = std::time::Instant::now();
     let mut child = c.spawn().context("spawning git")?;
     // Written from another thread while the output is read, or git blocks on a
@@ -268,17 +271,28 @@ pub fn is_ancestor(a: &str, b: &str) -> bool {
     run_raw(None, &["merge-base", "--is-ancestor", a, b], None, &[]).map(|o| o.ok).unwrap_or(false)
 }
 
+type Chains = HashMap<(String, Vec<String>), Vec<(String, Vec<String>)>>;
+/// `own_chain` answers by shas. A fetch clears it: an exclude that was missing
+/// (and so ignored) may exist now.
+static CHAINS: std::sync::Mutex<Option<Chains>> = std::sync::Mutex::new(None);
+
 /// Commits reachable from `tip` but from none of `excludes`, oldest first.
 /// Excludes that no longer exist are ignored.
 pub fn own_commits(tip: &str, excludes: &[String]) -> Result<Vec<String>> {
-    let mut args = vec!["rev-list".to_string(), "--reverse".into(), "--ignore-missing".into(), tip.to_string()];
-    args.extend(excludes.iter().filter(|e| !e.is_empty()).map(|e| format!("^{e}")));
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    Ok(run(&args)?.lines().map(str::to_string).collect())
+    Ok(own_chain(tip, excludes)?.into_iter().map(|(c, _)| c).collect())
 }
 
-/// `own_commits`, each with its parents.
+/// `own_commits`, each with its parents. Asked again with the same shas (as
+/// `gt log` does for a branch's row and then its size), it answers from memory:
+/// commits never change, so the answer can't either.
 pub fn own_chain(tip: &str, excludes: &[String]) -> Result<Vec<(String, Vec<String>)>> {
+    let is_sha = |s: &str| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    // A name like HEAD or a branch can move, so only shas are remembered.
+    let key = (is_sha(tip) && excludes.iter().all(|e| e.is_empty() || is_sha(e)))
+        .then(|| (tip.to_string(), excludes.to_vec()));
+    if let Some(hit) = key.as_ref().and_then(|k| CHAINS.lock().unwrap().as_ref()?.get(k).cloned()) {
+        return Ok(hit);
+    }
     let mut args = vec![
         "rev-list".to_string(),
         "--reverse".into(),
@@ -288,13 +302,17 @@ pub fn own_chain(tip: &str, excludes: &[String]) -> Result<Vec<(String, Vec<Stri
     ];
     args.extend(excludes.iter().filter(|e| !e.is_empty()).map(|e| format!("^{e}")));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    Ok(run(&args)?
+    let chain: Vec<(String, Vec<String>)> = run(&args)?
         .lines()
         .filter_map(|l| {
             let mut f = l.split(' ').map(str::to_string);
             Some((f.next()?, f.collect()))
         })
-        .collect())
+        .collect();
+    if let Some(k) = key {
+        CHAINS.lock().unwrap().get_or_insert_default().insert(k, chain.clone());
+    }
+    Ok(chain)
 }
 
 /// Commits only on `a` and commits only on `b`.
@@ -411,10 +429,14 @@ pub fn rebase_in_progress(git_dir: &Path) -> bool {
     git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists()
 }
 
-/// Candidate URLs for a remote: as configured, then with `insteadOf` rewrites applied.
+/// Candidate URLs for a remote: as configured, then with `insteadOf` rewrites
+/// applied. Read in-process rather than by spawning git twice.
 pub fn remote_urls(remote: &str) -> Vec<String> {
-    let raw = run(&["config", "--get", &format!("remote.{remote}.url")]).ok();
-    let expanded = run(&["remote", "get-url", remote]).ok();
+    let Ok(repo) = open() else { return Vec::new() };
+    let raw = repo.config_snapshot().string(format!("remote.{remote}.url").as_str()).map(|u| u.to_string());
+    let expanded = repo.find_remote(remote).ok().and_then(|r| {
+        Some(r.url(gix::remote::Direction::Fetch)?.to_bstring().to_string()).filter(|u| Some(u) != raw.as_ref())
+    });
     raw.into_iter().chain(expanded).collect()
 }
 
