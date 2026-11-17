@@ -48,17 +48,17 @@ pub fn link(url: &str, text: &str) -> String {
 }
 
 pub fn info(msg: &str) {
-    eprintln!("{} {msg}", cyan("›"));
+    crate::journal::print_line(true, &format!("{} {msg}", cyan("›")));
     crate::journal::stderr("info", msg);
 }
 
 pub fn ok(msg: &str) {
-    eprintln!("{} {msg}", green("✓"));
+    crate::journal::print_line(true, &format!("{} {msg}", green("✓")));
     crate::journal::stderr("ok", msg);
 }
 
 pub fn warn(msg: &str) {
-    eprintln!("{} {msg}", yellow("!"));
+    crate::journal::print_line(true, &format!("{} {msg}", yellow("!")));
     crate::journal::stderr("warn", msg);
 }
 

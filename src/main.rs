@@ -289,7 +289,7 @@ fn main() {
         },
     };
     if let Err(e) = res {
-        eprintln!("{} {e:#}", ui::red("error:"));
+        journal::print_line(true, &format!("{} {e:#}", ui::red("error:")));
         journal::end(1, Some(&format!("{e:#}")));
         std::process::exit(1);
     }

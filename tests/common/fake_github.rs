@@ -335,6 +335,7 @@ impl State {
         }
 
         let history = query.contains("timelineItems");
+        let mut errors = vec![];
         let mut repo = serde_json::Map::new();
         repo.insert("id".into(), json!("R_1"));
         for call in calls(query) {
@@ -344,7 +345,15 @@ impl State {
                     match self.prs.iter().find(|p| p.number == n) {
                         Some(p) if history => self.history_json(p),
                         Some(p) => self.pr_json(p),
-                        None => Value::Null,
+                        // As GitHub does: null data plus an error naming the number.
+                        None => {
+                            errors.push(json!({
+                                "type": "NOT_FOUND",
+                                "path": ["repository", call.alias],
+                                "message": format!("Could not resolve to a PullRequest with the number of {n}."),
+                            }));
+                            Value::Null
+                        }
                     }
                 }
                 "pullRequests" => {
@@ -366,7 +375,11 @@ impl State {
             };
             repo.insert(call.alias.into(), v);
         }
-        json!({ "data": { "repository": repo } })
+        if errors.is_empty() {
+            json!({ "data": { "repository": repo } })
+        } else {
+            json!({ "data": { "repository": repo }, "errors": errors })
+        }
     }
 
     /// Handles one request; returns (status, body).

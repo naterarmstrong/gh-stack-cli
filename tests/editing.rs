@@ -73,6 +73,20 @@ fn create_with_nothing_staged_makes_an_empty_branch() {
 }
 
 #[test]
+fn create_asks_before_making_an_empty_branch_in_a_terminal() {
+    let w = World::new();
+    let (out, screen) = w.gt_with_tty(&["create", "loud"], &["n"]);
+    assert!(!out.ok(), "{out:?}");
+    assert!(screen.contains("Nothing is staged. Create loud as an empty branch?"), "{screen}");
+    assert_eq!(w.head("loud"), None);
+    assert!(w.stacks().is_empty(), "{:?}", w.stacks());
+
+    let (out, _) = w.gt_with_tty(&["create", "loud"], &["y"]);
+    assert!(out.ok(), "{out:?}");
+    assert_eq!(w.head("loud"), w.head("main"));
+}
+
+#[test]
 fn create_refuses_an_existing_branch_or_no_name() {
     let w = World::new();
     w.git(&["branch", "taken"]);

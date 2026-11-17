@@ -272,3 +272,12 @@ fn loc_takes_any_commit() {
     let out = w.gt_err(&["loc", "no-such-thing"]);
     assert!(out.stderr.contains("no local branch or tracked PR matches"), "{out:?}");
 }
+
+#[test]
+fn a_reader_that_stops_reading_is_not_a_panic() {
+    let w = World::new();
+    w.create("feat-a", "a.rs", "a\n");
+    let out = w.gt_to_closed_pipe(&["ls"]);
+    assert!(out.ok(), "{out:?}");
+    assert!(!out.stderr.contains("panicked"), "{out:?}");
+}

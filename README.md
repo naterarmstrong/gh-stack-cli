@@ -91,7 +91,7 @@ One commit per branch is the simple case, and nothing changes for it. When a bra
 
 | Command | What it does |
 | --- | --- |
-| `gt create [name] -m <msg>` (`c`) | Create a branch above the current one and commit staged changes to it. `--base <branch>` puts it above that branch (name or PR number) instead; uncommitted changes come along, as with `git checkout -b`. `-a` stages everything first. The name comes from the message if you leave it out. The branch is local until submitted, unless it goes below a branch that's already shared. |
+| `gt create [name] -m <msg>` (`c`) | Create a branch above the current one and commit staged changes to it. `--base <branch>` puts it above that branch (name or PR number) instead; uncommitted changes come along, as with `git checkout -b`. `-a` stages everything first. The name comes from the message if you leave it out. With nothing staged it asks before creating an empty branch (and just creates it when there's no terminal). The branch is local until submitted, unless it goes below a branch that's already shared. |
 | `gt modify` (`m`) | Amend the current branch's commit (or make the first one if the branch has none), then restack everything above it. A branch that already has several commits gets a new commit instead, and `--new-commit` adds one to a single-commit branch too. On a branch outside any stack it just commits, with nothing to restack. `-a` stages everything, `-m` replaces the message (or sets it, for a new commit). With nothing staged, it only restacks. |
 | `gt restack` (`r`) | Rebase each branch onto its parent, in memory. `--trunk` also moves the bottom branch onto the latest remote trunk. |
 | `gt squash` | Fold each branch in the stack down to one commit. The content stays the same. |

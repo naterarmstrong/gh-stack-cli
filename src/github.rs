@@ -235,8 +235,10 @@ impl Client {
             if resp.get("data").is_none_or(Value::is_null) {
                 bail!("graphql: {}", msgs.join("; "));
             }
-            for m in msgs {
-                crate::ui::warn(&format!("github: {m}"));
+            // A PR that doesn't exist comes back as null; callers handle that.
+            let not_found = |e: &&Value| e["type"].as_str() == Some("NOT_FOUND");
+            for e in errs.iter().filter(|e| !not_found(e)) {
+                crate::ui::warn(&format!("github: {}", e["message"].as_str().unwrap_or_default()));
             }
         }
         Ok(resp["data"].clone())

@@ -814,8 +814,16 @@ pub fn create(name: Option<String>, message: Option<String>, all: bool, base: Op
     if all {
         git::run(&["add", "-A"])?;
     }
+    let staged = git::has_staged_changes()?;
+    // A short alias makes a typo (`gt c loud` for `gt cloud`) create a branch;
+    // in a terminal, check before making an empty one. Scripts still get it.
+    if !staged
+        && picker::confirm(&format!("Nothing is staged. Create {name} as an empty branch?")).is_ok_and(|yes| !yes)
+    {
+        bail!("nothing created");
+    }
     git::run(&["checkout", "--quiet", "-b", &name, &cur])?;
-    if git::has_staged_changes()? {
+    if staged {
         let ok = match &message {
             Some(m) => git::run_interactive(None, &["commit", "--quiet", "-m", m])?,
             None => git::run_interactive(None, &["commit", "--quiet"])?,
@@ -1125,6 +1133,15 @@ fn fetch(ctx: &Ctx, branches: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Which of `branches` exist on the remote right now, from one `git ls-remote`.
+fn remote_heads(ctx: &Ctx, branches: &[String]) -> Result<HashSet<String>> {
+    let refs: Vec<String> = branches.iter().map(|b| format!("refs/heads/{b}")).collect();
+    let mut args = vec!["ls-remote", "--heads", ctx.remote.as_str()];
+    args.extend(refs.iter().map(String::as_str));
+    let out = git::run(&args)?;
+    Ok(out.lines().filter_map(|l| l.split_once("\trefs/heads/").map(|(_, b)| b.to_string())).collect())
+}
+
 /// The PR behind each review branch, by branch name. Empty offline, or when
 /// GitHub can't be reached (which only warns).
 fn review_prs(ctx: &Ctx, offline: bool) -> HashMap<String, Pr> {
@@ -1335,8 +1352,37 @@ fn record_prs(ctx: &mut Ctx, sis: &[usize], prs: &HashMap<String, Pr>) {
             if pr.state == "MERGED" && !r.merged {
                 r.merged = true;
                 ui::ok(&format!("{} merged (#{})", ui::bold(&b.branch), pr.number));
-            } else if pr.state == "CLOSED" {
-                ui::warn(&format!("{}'s PR #{} was closed without merging", b.branch, pr.number));
+            } else if pr.state == "CLOSED" && !r.closed {
+                r.closed = true;
+                ui::warn(&format!(
+                    "{}'s PR #{} was closed without merging; `gt delete {}` removes it locally",
+                    b.branch, pr.number, b.branch
+                ));
+            } else if pr.state != "CLOSED" {
+                r.closed = false;
+            }
+        }
+    }
+}
+
+/// Drops the PR link of each unmerged branch whose PR GitHub no longer has (a
+/// deleted PR comes back empty when asked for by number), so later syncs look
+/// the branch up by name instead of asking for it forever.
+fn unlink_missing_prs(ctx: &mut Ctx, sis: &[usize], prs: &HashMap<String, Pr>) {
+    for &si in sis {
+        let by_number: HashSet<String> = ctx
+            .pr_queries(si, true)
+            .into_iter()
+            .filter(|(_, q)| matches!(q, PrQuery::Number(_)))
+            .map(|(b, _)| b)
+            .collect();
+        for b in ctx.store.file.stacks[si].branches.iter_mut() {
+            if b.merged() || !by_number.contains(&b.branch) || prs.contains_key(&b.branch) {
+                continue;
+            }
+            if let Some(n) = b.pr_number() {
+                ui::warn(&format!("{}'s PR #{n} no longer exists on GitHub; unlinked it", b.branch));
+                b.pull_request = None;
             }
         }
     }
@@ -1373,6 +1419,9 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
 
     // 1. One GraphQL round trip for every PR: learn numbers and what merged.
     let prs = if opts.offline { HashMap::new() } else { fetch_prs(&ctx, &pr_sis, true)?.1 };
+    if !opts.offline {
+        unlink_missing_prs(&mut ctx, &pr_sis, &prs);
+    }
     record_prs(&mut ctx, &pr_sis, &prs);
 
     // 2. One fetch for the trunks and every branch whose head still exists on the remote.
@@ -1394,9 +1443,20 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
     to_fetch.sort();
     to_fetch.dedup();
     if let Err(e) = fetch(&ctx, &to_fetch) {
-        ui::warn(&format!("{e:#}; retrying with trunks only"));
-        let trunks: Vec<String> = sis.iter().map(|&si| ctx.store.file.stacks[si].trunk.branch.clone()).collect();
-        fetch(&ctx, &trunks)?;
+        // One head gone from the remote (deleted, renamed) fails the whole
+        // fetch, so ask which still exist and fetch those.
+        let there = remote_heads(&ctx, &to_fetch)?;
+        let (present, gone): (Vec<String>, Vec<String>) = to_fetch.into_iter().partition(|b| there.contains(b));
+        if gone.is_empty() {
+            return Err(e);
+        }
+        ui::warn(&format!(
+            "{} {} gone from {}; fetching the rest",
+            gone.join(", "),
+            if gone.len() == 1 { "is" } else { "are" },
+            ctx.remote
+        ));
+        fetch(&ctx, &present)?;
     }
     let review_prs = review_prs(&ctx, opts.offline);
     fetch_reviews(&ctx, &review_prs);
@@ -1570,11 +1630,14 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         ui::ok(&format!("stack on {} is fully merged", ctx.store.file.stacks[si].trunk.branch));
     }
     render_stacks(&ctx, &live, &prs, true);
-    // A fully merged stack whose branches are all deleted has nothing left to
-    // sync or show; dropping it keeps the state file from growing forever.
+    // A stack whose PRs all merged or closed, with every branch deleted, has
+    // nothing left to sync or show; dropping it keeps the state file from
+    // growing forever.
     let before = ctx.store.file.stacks.len();
     let heads = &ctx.refs.heads;
-    ctx.store.file.stacks.retain(|s| !s.fully_merged() || s.branches.iter().any(|b| heads.contains_key(&b.branch)));
+    ctx.store.file.stacks.retain(|s| {
+        s.branches.is_empty() || s.branches.iter().any(|b| !(b.merged() || b.closed()) || heads.contains_key(&b.branch))
+    });
     if ctx.store.file.stacks.len() != before {
         ctx.save()?;
     }
@@ -2602,7 +2665,17 @@ fn history_target(ctx: &Ctx, target: Option<String>) -> Result<(String, history:
 pub fn history_list(target: Option<String>, json: bool) -> Result<()> {
     let ctx = Ctx::new(false)?;
     let (branch, at) = history_target(&ctx, target)?;
-    let mut h = history::load(&ctx.info.common_dir, &ctx.remote, &branch, &at, true)?;
+    let mut h = match history::load(&ctx.info.common_dir, &ctx.remote, &branch, &at, true) {
+        Ok(h) => h,
+        // A branch with nothing of its own yet has an empty history, not a broken one.
+        Err(e) if json && e.downcast_ref::<history::NoVersions>().is_some() => {
+            let tip = ctx.refs.head(&branch).unwrap_or_default();
+            let v = serde_json::json!({ "branch": branch, "parent": at.parent, "tip": tip, "versions": [] });
+            outln!("{}", serde_json::to_string_pretty(&v)?);
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     if json {
         h.versions.reverse();
         outln!("{}", serde_json::to_string_pretty(&h)?);
@@ -2652,7 +2725,7 @@ pub fn history_compare(from: Option<String>, to: Option<String>, target: Option<
         ui::yellow(ui::short(&b.sha))
     );
     use std::io::Write;
-    std::io::stdout().flush()?;
+    let _ = std::io::stdout().flush();
     // git's own diff, with the user's pager, colors and diff settings.
     git::run_interactive(None, &["diff", &left, &right])?;
     Ok(())

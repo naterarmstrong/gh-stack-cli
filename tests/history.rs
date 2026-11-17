@@ -241,3 +241,15 @@ fn squashing_folds_into_the_latest_version() {
     let v = history_json(&w, &[]);
     assert_eq!(versions(&v), vec![(3, true), (2, false), (1, false)]);
 }
+
+#[test]
+fn json_history_of_a_branch_with_nothing_of_its_own_is_empty() {
+    let w = World::new();
+    w.git(&["branch", "placeholder"]);
+    let v = history_json(&w, &["placeholder"]);
+    assert_eq!(v["branch"], "placeholder");
+    assert_eq!(v["versions"], serde_json::json!([]));
+    // Only --json treats it as empty; on screen it's still explained.
+    let out = w.gt_err(&["history", "placeholder"]);
+    assert!(out.stderr.contains("placeholder has no commit of its own"), "{out:?}");
+}

@@ -234,6 +234,50 @@ fn sync_sees_a_reset_onto_the_remote_then_an_amend_as_built_on_it() {
 }
 
 #[test]
+fn sync_reports_a_closed_pr_once() {
+    let w = submitted();
+    w.gh().update(1, |p| p.state = "CLOSED".into());
+    let out = w.gt_ok(&["sync"]);
+    assert!(out.stderr.contains("feat-a's PR #1 was closed without merging; `gt delete feat-a`"), "{out:?}");
+    let out = w.gt_ok(&["sync"]);
+    assert!(!out.stderr.contains("closed without merging"), "{out:?}");
+
+    // Reopened, then closed again: reported again.
+    w.gh().update(1, |p| p.state = "OPEN".into());
+    w.gt_ok(&["sync"]);
+    w.gh().update(1, |p| p.state = "CLOSED".into());
+    let out = w.gt_ok(&["sync"]);
+    assert!(out.stderr.contains("closed without merging"), "{out:?}");
+}
+
+#[test]
+fn sync_unlinks_a_pr_github_no_longer_has() {
+    let w = submitted();
+    w.edit_branch_state("feat-a", |b| b["pullRequest"]["number"] = 99.into());
+    let out = w.gt_ok(&["sync"]);
+    assert!(out.stderr.contains("feat-a's PR #99 no longer exists on GitHub; unlinked it"), "{out:?}");
+    assert!(!out.stderr.contains("Could not resolve"), "{out:?}");
+
+    // Looked up by name from then on, which finds its real PR.
+    let out = w.gt_ok(&["sync"]);
+    assert!(!out.stderr.contains("#99"), "{out:?}");
+    assert_eq!(w.branch_state("feat-a")["pullRequest"]["number"], 1);
+}
+
+#[test]
+fn sync_fetches_the_rest_when_a_branch_is_gone_from_the_remote() {
+    let w = submitted();
+    let theirs = w.teammate_push("feat-b", "b.rs", "fixed by bot\n", false);
+    w.git_in(&w.teammate(), &["push", "--quiet", "origin", "--delete", "feat-a"]);
+
+    let out = w.gt_ok(&["sync"]);
+    assert!(out.stderr.contains("feat-a is gone from origin; fetching the rest"), "{out:?}");
+    assert!(out.stderr.contains("pulled remote changes into feat-b"), "{out:?}");
+    assert_eq!(w.show("feat-b", "b.rs").as_deref(), Some("fixed by bot\n"));
+    assert_eq!(w.config("branch.feat-b.gtSynced").as_deref(), Some(theirs.as_str()));
+}
+
+#[test]
 fn sync_takes_a_teammates_push_when_local_is_unedited() {
     let w = submitted();
     let theirs = w.teammate_push("feat-a", "a.rs", "fixed by bot\n", false);

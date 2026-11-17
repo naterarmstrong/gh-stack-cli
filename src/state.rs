@@ -34,6 +34,9 @@ pub struct PrRef {
     pub url: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub merged: bool,
+    /// Closed without merging, as of the last sync (so it's reported once).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub closed: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -62,6 +65,10 @@ impl BranchRef {
 
     pub fn merged(&self) -> bool {
         self.pull_request.as_ref().is_some_and(|p| p.merged)
+    }
+
+    pub fn closed(&self) -> bool {
+        self.pull_request.as_ref().is_some_and(|p| p.closed)
     }
 
     pub fn pr_number(&self) -> Option<u64> {

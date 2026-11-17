@@ -255,6 +255,25 @@ impl World {
         (out, screen)
     }
 
+    /// Runs gt in the clone with stdout a pipe nobody reads (its read end is
+    /// closed before gt starts, as after `gt ls | head` stops reading).
+    pub fn gt_to_closed_pipe(&self, args: &[&str]) -> Out {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+        unsafe { libc::close(fds[0]) };
+        let write_end = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+        let mut c = Command::new(env!("CARGO_BIN_EXE_gt"));
+        c.current_dir(&self.repo).args(args).stdout(std::process::Stdio::from(write_end));
+        self.env(&mut c);
+        let out = c.output().expect("running gt");
+        Out {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::new(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    }
+
     /// Runs gt in the clone, whatever the outcome.
     pub fn gt(&self, args: &[&str]) -> Out {
         self.gt_in(&self.repo, args)

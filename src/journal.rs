@@ -237,13 +237,21 @@ fn plain(s: &str) -> String {
     out
 }
 
+/// Writes one line to stdout, or stderr with `err`. A reader that went away
+/// (`gt ls | head`, a caller that stopped listening) drops the line instead of
+/// panicking the way `println!` does.
+pub fn print_line(err: bool, s: &str) {
+    use std::io::Write;
+    let _ = if err { writeln!(std::io::stderr().lock(), "{s}") } else { writeln!(std::io::stdout().lock(), "{s}") };
+}
+
 /// `println!` that also goes in the log.
 #[macro_export]
 macro_rules! outln {
     () => { $crate::outln!("") };
     ($($arg:tt)*) => {{
         let s = format!($($arg)*);
-        println!("{s}");
+        $crate::journal::print_line(false, &s);
         $crate::journal::stdout(&s);
     }};
 }
@@ -254,7 +262,7 @@ macro_rules! errln {
     () => { $crate::errln!("") };
     ($($arg:tt)*) => {{
         let s = format!($($arg)*);
-        eprintln!("{s}");
+        $crate::journal::print_line(true, &s);
         $crate::journal::stderr("err", &s);
     }};
 }

@@ -547,6 +547,20 @@ impl Own {
     }
 }
 
+/// Why a branch has no versions to show: no reflog here, or nothing in it of
+/// its own (a placeholder branch, or one that only ever followed its parent).
+/// `--json` callers get an empty list for it rather than a failure.
+#[derive(Debug)]
+pub struct NoVersions(pub String);
+
+impl std::fmt::Display for NoVersions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoVersions {}
+
 /// Builds `branch`'s version history. `with_deltas` also sizes what each version changed.
 pub fn load(common_dir: &Path, remote: &str, branch: &str, at: &Placement, with_deltas: bool) -> Result<History> {
     let repo = git::open()?;
@@ -558,7 +572,9 @@ pub fn load(common_dir: &Path, remote: &str, branch: &str, at: &Placement, with_
         .ok_or_else(|| anyhow!("no local branch {branch}"))?;
     let entries = reflog(&repo, &format!("refs/heads/{branch}"));
     if entries.is_empty() {
-        bail!("{branch} has no reflog (reflogs are per-clone, and git expires old entries)");
+        return Err(
+            NoVersions(format!("{branch} has no reflog (reflogs are per-clone, and git expires old entries)")).into()
+        );
     }
 
     // The branch's own entries: not a commit that ever sat on a lower branch,
@@ -579,7 +595,7 @@ pub fn load(common_dir: &Path, remote: &str, branch: &str, at: &Placement, with_
     let reach = not_below(&candidates, &at.below.iter().filter(|s| commits.exists(s)).collect::<Vec<_>>())?;
     let entries: Vec<&Entry> = entries.iter().filter(|e| reach.contains(&e.sha) && !theirs.contains(&e.sha)).collect();
     if entries.is_empty() {
-        bail!("{branch} has no commit of its own in its reflog");
+        return Err(NoVersions(format!("{branch} has no commit of its own in its reflog")).into());
     }
     let own = Own { reach, theirs };
 
