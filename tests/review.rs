@@ -89,6 +89,19 @@ fn sync_deletes_a_review_branch_once_its_pr_merges() {
 }
 
 #[test]
+fn sync_skips_fetching_a_merged_review_whose_branch_is_gone() {
+    let w = World::with_github();
+    let n = their_pr(&w, "their-feature", "main", "t.rs");
+    w.gt_ok(&["review", &n.to_string()]);
+    w.merge_pr(n);
+    w.git_in(&w.teammate(), &["push", "--quiet", "origin", "--delete", "their-feature"]);
+
+    let out = w.gt_ok(&["sync"]);
+    assert!(!out.stderr.contains("couldn't fetch"), "{out:?}");
+    assert!(out.stderr.contains("deleted review branch their-feature (#1 merged)"), "{out:?}");
+}
+
+#[test]
 fn sync_no_prune_keeps_merged_review_branches() {
     let w = World::with_github();
     let n = their_pr(&w, "their-feature", "main", "t.rs");

@@ -173,6 +173,7 @@ fn sync_reports_a_fully_merged_stack() {
     assert_eq!(w.current(), "main");
     assert_eq!(w.head("feat-b"), None);
     assert_eq!(w.show("main", "b.rs").as_deref(), Some("b\n"));
+    assert!(w.stacks().is_empty(), "the merged stack is dropped from state: {:?}", w.stacks());
 }
 
 #[test]
@@ -186,6 +187,50 @@ fn sync_keeps_a_merged_branch_that_differs_from_what_merged() {
     assert!(out.stderr.contains("feat-a merged at"), "{out:?}");
     assert!(out.stderr.contains("keeping it"), "{out:?}");
     assert!(w.head("feat-a").is_some());
+}
+
+#[test]
+fn sync_deletes_a_merged_branch_the_pr_moved_past_before_merging() {
+    let w = submitted();
+    // A bot pushes a fix and the PR merges before this clone ever fetches it.
+    w.teammate_push("feat-a", "a.rs", "fixed by bot\n", false);
+    let local = w.head("feat-a").unwrap();
+    w.merge_pr(1);
+
+    let out = w.gt_ok(&["sync"]);
+    assert!(out.stderr.contains(&format!("deleted merged branch feat-a (was {})", &local[..8])), "{out:?}");
+    assert_eq!(w.head("feat-a"), None);
+}
+
+#[test]
+fn sync_deletes_a_merged_branch_rewritten_on_the_remote_using_push_history() {
+    let w = submitted();
+    // Nothing here records the old head: only GitHub's push history does.
+    w.git(&["config", "--unset", "branch.feat-a.gtSynced"]);
+    w.teammate_push("feat-a", "a.rs", "rewritten\n", true);
+    w.merge_pr(1);
+
+    let out = w.gt_ok(&["sync"]);
+    assert!(out.stderr.contains("deleted merged branch feat-a"), "{out:?}");
+    assert_eq!(w.head("feat-a"), None);
+}
+
+#[test]
+fn sync_sees_a_reset_onto_the_remote_then_an_amend_as_built_on_it() {
+    let w = submitted();
+    w.teammate_push("feat-a", "a.rs", "theirs\n", true);
+    w.git(&["fetch", "--quiet", "origin"]);
+    w.gt_ok(&["bottom"]);
+    w.git(&["reset", "--quiet", "--hard", "origin/feat-a"]);
+    w.write("a.rs", "theirs, then mine\n");
+    w.gt_ok(&["modify", "-a"]);
+
+    let out = w.gt_ok(&["sync"]);
+    assert!(!out.stderr.contains("changed both locally"), "{out:?}");
+    assert_eq!(w.show("feat-a", "a.rs").as_deref(), Some("theirs, then mine\n"));
+    assert_eq!(w.config("branch.feat-a.gtSynced"), w.remote_head("feat-a"));
+    w.gt_ok(&["submit"]);
+    assert_eq!(w.remote_head("feat-a"), w.head("feat-a"));
 }
 
 #[test]

@@ -1125,10 +1125,28 @@ fn fetch(ctx: &Ctx, branches: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The PR behind each review branch, by branch name. Empty offline, or when
+/// GitHub can't be reached (which only warns).
+fn review_prs(ctx: &Ctx, offline: bool) -> HashMap<String, Pr> {
+    let queries: Vec<(String, PrQuery)> =
+        ctx.reviews.iter().filter_map(|r| Some((r.branch.clone(), PrQuery::Number(r.pr?)))).collect();
+    if offline || queries.is_empty() {
+        return HashMap::new();
+    }
+    match query_prs(ctx, queries, false) {
+        Ok((_, m)) => m,
+        Err(e) => {
+            ui::warn(&format!("couldn't check review PRs: {e:#}"));
+            HashMap::new()
+        }
+    }
+}
+
 /// Refreshes what each review branch is compared against, never the branch
-/// itself. One fetch, then one per branch if that fails (a merged PR's head
-/// branch may be gone); failures only warn.
-fn fetch_reviews(ctx: &Ctx) {
+/// itself. A PR GitHub says is closed or merged is skipped, since its head
+/// branch is usually deleted. One fetch, then one per branch if that fails;
+/// failures only warn.
+fn fetch_reviews(ctx: &Ctx, prs: &HashMap<String, Pr>) {
     let spec = |r: &Review| match r.fork_pr() {
         Some(n) => format!("+refs/pull/{n}/head:{}", ctx.review_ref(r)),
         None => format!("+refs/heads/{}:{}", r.branch, ctx.review_ref(r)),
@@ -1138,11 +1156,13 @@ fn fetch_reviews(ctx: &Ctx) {
         args.extend(specs.iter().map(String::as_str));
         git::run_raw(None, &args, None, &[]).map(|o| o.ok).unwrap_or(false)
     };
-    let specs: Vec<String> = ctx.reviews.iter().map(spec).collect();
+    let open: Vec<&Review> =
+        ctx.reviews.iter().filter(|r| prs.get(&r.branch).is_none_or(|p| p.state == "OPEN")).collect();
+    let specs: Vec<String> = open.iter().map(|r| spec(r)).collect();
     if specs.is_empty() || fetch(&specs) {
         return;
     }
-    for (r, s) in ctx.reviews.iter().zip(&specs) {
+    for (r, s) in open.iter().zip(&specs) {
         if !fetch(std::slice::from_ref(s)) {
             ui::warn(&format!("couldn't fetch the PR head of review branch {}", r.branch));
         }
@@ -1151,9 +1171,10 @@ fn fetch_reviews(ctx: &Ctx) {
 
 /// Moves each review branch to its PR head, whether the PR gained commits or
 /// was force-pushed. Local commits on it are dropped (the reflog keeps them);
-/// a checkout whose uncommitted changes are in the way is left alone.
-fn update_reviews(ctx: &Ctx) {
-    for r in &ctx.reviews {
+/// a checkout whose uncommitted changes are in the way is left alone. One
+/// whose PR merged is left for `prune_reviews`.
+fn update_reviews(ctx: &Ctx, prs: &HashMap<String, Pr>) {
+    for r in ctx.reviews.iter().filter(|r| prs.get(&r.branch).is_none_or(|p| p.state != "MERGED")) {
         let (Some(local), Some(tip)) = (ctx.refs.head(&r.branch), ctx.review_tip(r)) else { continue };
         if local == tip {
             continue;
@@ -1328,12 +1349,13 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         if ctx.reviews.is_empty() {
             bail!("nothing to sync");
         }
-        fetch_reviews(&ctx);
+        let review_prs = review_prs(&ctx, opts.offline);
+        fetch_reviews(&ctx, &review_prs);
         ctx.reload()?;
-        update_reviews(&ctx);
+        update_reviews(&ctx, &review_prs);
         ctx.reload()?;
-        if !opts.no_prune && !opts.offline {
-            prune_reviews(&mut ctx)?;
+        if !opts.no_prune {
+            prune_reviews(&mut ctx, &review_prs)?;
         }
         return Ok(());
     }
@@ -1376,18 +1398,19 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         let trunks: Vec<String> = sis.iter().map(|&si| ctx.store.file.stacks[si].trunk.branch.clone()).collect();
         fetch(&ctx, &trunks)?;
     }
-    fetch_reviews(&ctx);
+    let review_prs = review_prs(&ctx, opts.offline);
+    fetch_reviews(&ctx, &review_prs);
     ctx.reload()?;
-    update_reviews(&ctx);
+    update_reviews(&ctx, &review_prs);
     ctx.reload()?;
-    if !opts.no_prune && !opts.offline {
-        prune_reviews(&mut ctx)?;
+    if !opts.no_prune {
+        prune_reviews(&mut ctx, &review_prs)?;
     }
 
-    // 3. Delete local branches whose PRs merged, as long as the local head is
-    // exactly what was merged. Done before restacking so a stack that can't be
-    // restacked still gets cleaned up.
-    prune(&mut ctx, &prune_sis, &prs)?;
+    // 3. Delete local branches whose PRs merged, as long as the local head
+    // holds nothing the PR never had. Done before restacking so a stack that
+    // can't be restacked still gets cleaned up.
+    prune(&mut ctx, &prune_sis, &prs, opts.offline)?;
 
     // 4. Pull in commits pushed to our branches from elsewhere (a bot fix, a
     // teammate, another machine). A branch takes the remote when its local
@@ -1407,6 +1430,7 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         /// Whether local holds nothing the remote never had.
         stale: bool,
     }
+    let repo = git::open()?;
     let mut pulls = vec![];
     for &si in &sis {
         let s = ctx.store.file.stacks[si].clone();
@@ -1420,6 +1444,14 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
             // The remote is where gt last left it, so anything local is unpushed work.
             let synced = ctx.synced(&b.branch).map(str::to_string);
             if synced.as_deref() == Some(remote.as_str()) {
+                continue;
+            }
+            // Local held the remote commit before it was edited (a reset onto
+            // the remote, then an amend), so it's built on it already.
+            if local.is_some()
+                && history::reflog(&repo, &format!("refs/heads/{}", b.branch)).iter().any(|e| e.sha == remote)
+            {
+                ctx.set_synced(&b.branch, &remote)?;
                 continue;
             }
             let old_r = old_remote.get(&b.branch);
@@ -1538,6 +1570,14 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         ui::ok(&format!("stack on {} is fully merged", ctx.store.file.stacks[si].trunk.branch));
     }
     render_stacks(&ctx, &live, &prs, true);
+    // A fully merged stack whose branches are all deleted has nothing left to
+    // sync or show; dropping it keeps the state file from growing forever.
+    let before = ctx.store.file.stacks.len();
+    let heads = &ctx.refs.heads;
+    ctx.store.file.stacks.retain(|s| !s.fully_merged() || s.branches.iter().any(|b| heads.contains_key(&b.branch)));
+    if ctx.store.file.stacks.len() != before {
+        ctx.save()?;
+    }
     if !skipped.is_empty() {
         errln!(
             "\n{} need a rebase. To resolve one: `gt checkout <branch> && gt restack --trunk`.",
@@ -1636,16 +1676,7 @@ fn share_local_prs(ctx: &mut Ctx, sis: &[usize], prs: &HashMap<String, Pr>) -> R
 
 /// Deletes review branches whose PR merged. They're read-only copies, so
 /// nothing local is lost, but one checked out in another worktree is kept.
-fn prune_reviews(ctx: &mut Ctx) -> Result<()> {
-    let queries: Vec<(String, PrQuery)> =
-        ctx.reviews.iter().filter_map(|r| Some((r.branch.clone(), PrQuery::Number(r.pr?)))).collect();
-    let prs = match query_prs(ctx, queries, false) {
-        Ok((_, m)) => m,
-        Err(e) => {
-            ui::warn(&format!("couldn't check review PRs for merges: {e:#}"));
-            return Ok(());
-        }
-    };
+fn prune_reviews(ctx: &mut Ctx, prs: &HashMap<String, Pr>) -> Result<()> {
     let trunk = ctx.default_trunk();
     for r in ctx.reviews.clone() {
         let Some(pr) = prs.get(&r.branch).filter(|p| p.state == "MERGED") else { continue };
@@ -1667,41 +1698,99 @@ fn prune_reviews(ctx: &mut Ctx) -> Result<()> {
     ctx.reload()
 }
 
-fn prune(ctx: &mut Ctx, sis: &[usize], prs: &HashMap<String, Pr>) -> Result<()> {
+/// Whether `local` holds nothing `branch`'s remote never had: it's `remote` or
+/// behind it, gt synced it (or a restack of what gt synced), or a fetch or
+/// push once put it on the remote-tracking ref.
+fn on_remote_once(
+    ctx: &Ctx,
+    repo: &gix::Repository,
+    branch: &str,
+    local: &str,
+    remote: &str,
+    below: &[String],
+) -> bool {
+    local == remote
+        || git::is_ancestor(local, remote)
+        || ctx.synced(branch).is_some_and(|s| s == local || same_patch_as_any(ctx, local, &[s], below))
+        || history::reflog(repo, &ctx.remote_ref(branch)).iter().any(|e| e.sha == local)
+}
+
+fn prune(ctx: &mut Ctx, sis: &[usize], prs: &HashMap<String, Pr>, offline: bool) -> Result<()> {
+    // Delete a merged branch when the local head holds nothing the PR's head
+    // never had: the PR may have moved on (a bot fix, another checkout's
+    // push) before it merged, and nothing here ever fetched that.
+    struct Merged {
+        si: usize,
+        idx: usize,
+        local: String,
+        merged_head: String,
+        pr: Option<u64>,
+        below: Vec<String>,
+        pushed: bool,
+    }
+    let repo = git::open()?;
+    let mut merged = vec![];
     for &si in sis {
-        let s = ctx.store.file.stacks[si].clone();
+        let s = &ctx.store.file.stacks[si];
         for (idx, b) in s.branches.iter().enumerate().filter(|(_, b)| b.merged()) {
             let Some(local) = ctx.refs.head(&b.branch).map(str::to_string) else { continue };
-            // Only delete when the local head is exactly the commit GitHub merged.
-            let merged_head = match prs.get(&b.branch) {
-                Some(pr) => Some(pr.head_ref_oid.as_str()),
-                None => ctx.refs.remote.get(&b.branch).map(String::as_str),
-            };
-            match merged_head {
-                Some(h) if h == local => {}
-                Some(h) => {
-                    ui::warn(&format!(
-                        "{} merged at {}, but the local branch is at {}; keeping it",
-                        b.branch,
-                        ui::short(h),
-                        ui::short(&local)
-                    ));
-                    continue;
-                }
+            let merged_head = match prs.get(&b.branch).map(|p| &p.head_ref_oid).or(ctx.refs.remote.get(&b.branch)) {
+                Some(h) => h.clone(),
                 None => {
                     ui::warn(&format!("{} merged, but can't confirm what was merged (offline?); keeping it", b.branch));
                     continue;
                 }
+            };
+            let below = below_heads(ctx, s, idx);
+            let pushed = on_remote_once(ctx, &repo, &b.branch, &local, &merged_head, &below);
+            let pr = prs.get(&b.branch).map(|p| p.number).or(b.pr_number());
+            merged.push(Merged { si, idx, local, merged_head, pr, below, pushed });
+        }
+    }
+    let ask: Vec<u64> = merged.iter().filter(|m| !m.pushed).filter_map(|m| m.pr).collect();
+    if !ask.is_empty() && !offline {
+        match ctx.gh().and_then(|gh| gh.past_heads(&ask)) {
+            Ok(heads) => {
+                for m in merged.iter_mut().filter(|m| !m.pushed) {
+                    let Some(h) = m.pr.and_then(|n| heads.get(&n)) else { continue };
+                    let h: Vec<&str> = h.iter().map(String::as_str).collect();
+                    // Local was once the PR's head, or is a restack of one.
+                    m.pushed = h.contains(&m.local.as_str()) || same_patch_as_any(ctx, &m.local, &h, &m.below);
+                }
             }
-            if let Some(wt) = ctx.other_worktree(&b.branch) {
-                ui::info(&format!("{} merged; not deleting it, it's checked out in {}", b.branch, wt.display()));
-                continue;
-            }
-            if ctx.info.current_branch.as_deref() == Some(&b.branch) && !leave_merged(ctx, &s, idx)? {
-                continue;
-            }
-            git::run(&["branch", "--quiet", "-D", &b.branch])?;
+            Err(e) => ui::warn(&format!("couldn't read push history from GitHub: {e:#}")),
+        }
+    }
+
+    for m in merged {
+        let s = ctx.store.file.stacks[m.si].clone();
+        let b = &s.branches[m.idx];
+        if !m.pushed {
+            ui::warn(&format!(
+                "{} merged at {}, but the local branch is at {} with changes the PR never had; keeping it",
+                b.branch,
+                ui::short(&m.merged_head),
+                ui::short(&m.local)
+            ));
+            continue;
+        }
+        if let Some(wt) = ctx.other_worktree(&b.branch) {
+            ui::info(&format!("{} merged; not deleting it, it's checked out in {}", b.branch, wt.display()));
+            continue;
+        }
+        if ctx.info.current_branch.as_deref() == Some(&b.branch) && !leave_merged(ctx, &s, m.idx)? {
+            continue;
+        }
+        git::run(&["branch", "--quiet", "-D", &b.branch])?;
+        // The branch's reflog goes with it, so name a local head that never merged.
+        if m.local == m.merged_head {
             ui::ok(&format!("deleted merged branch {}", b.branch));
+        } else {
+            ui::ok(&format!(
+                "deleted merged branch {} {}",
+                b.branch,
+                ui::dim(&format!("(was {})", ui::short(&m.local)))
+            ));
         }
     }
     ctx.reload()
