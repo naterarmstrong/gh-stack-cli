@@ -293,6 +293,30 @@ fn sync_takes_a_teammates_push_when_local_is_unedited() {
 }
 
 #[test]
+fn sync_tracks_prs_stacked_on_top_from_another_clone() {
+    let w = submitted();
+    let other = second_clone(&w);
+    assert!(w.gt_in(&other, &["get", "2"]).ok());
+    write_in(&other, "c.rs", "c\n");
+    w.git_in(&other, &["add", "c.rs"]);
+    assert!(w.gt_in(&other, &["create", "feat-c", "-m", "Add c"]).ok());
+    assert!(w.gt_in(&other, &["submit"]).ok());
+    let c = w.gh().pr_for("feat-c");
+    assert_eq!(w.gh().stacks()[0].prs, vec![1, 2, c.number]);
+
+    let out = w.gt_ok(&["sync"]);
+    assert!(out.stderr.contains("tracking feat-c from GitHub stack #1"), "{out:?}");
+    assert_eq!(w.stacks(), vec![vec!["feat-a", "feat-b", "feat-c"]]);
+    assert_eq!(w.branch_state("feat-c")["pullRequest"]["number"], c.number);
+    assert_eq!(w.head("feat-c"), w.remote_head("feat-c"));
+    assert_eq!(w.parent("feat-c"), w.head("feat-b").unwrap());
+
+    // Already tracked: a second sync adds nothing.
+    let again = w.gt_ok(&["sync"]);
+    assert!(!again.stderr.contains("tracking"), "{again:?}");
+}
+
+#[test]
 fn sync_takes_a_push_onto_a_multi_commit_branch_as_it_is() {
     let w = submitted();
     w.gt_ok(&["bottom"]);

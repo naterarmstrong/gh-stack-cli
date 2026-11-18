@@ -1406,6 +1406,12 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         return Ok(());
     }
 
+    // PRs stacked on top elsewhere (another clone, the web UI) join first, so
+    // the steps below fetch, pull and restack them like the rest.
+    if !opts.offline {
+        track_new_stack_members(&mut ctx, &sis)?;
+    }
+
     // Merged branches are pruned from every stack, not just the ones being synced.
     let prune_sis: Vec<usize> = if opts.no_prune {
         vec![]
@@ -1652,6 +1658,68 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
             "\n{} changed locally and aren't pushed; `gt submit` pushes them.",
             unpushed.iter().map(|b| ui::bold(b)).collect::<Vec<_>>().join(", ")
         );
+    }
+    Ok(())
+}
+
+/// Tracks the open PRs GitHub's stack has above the highest one tracked
+/// locally. PRs it has in between are left to `gt submit --relink`, and a run
+/// stops at a PR another local stack already tracks.
+fn track_new_stack_members(ctx: &mut Ctx, sis: &[usize]) -> Result<()> {
+    let mut changed = false;
+    for &si in sis {
+        let s = ctx.store.file.stacks[si].clone();
+        if s.number == 0 {
+            continue;
+        }
+        let remote = match ctx.gh()?.get_stack(s.number) {
+            Ok(Some(r)) => r,
+            Ok(None) => continue,
+            Err(e) => {
+                ui::warn(&format!("couldn't read GitHub stack #{}: {e:#}", s.number));
+                continue;
+            }
+        };
+        let tracked = |p: &crate::github::RemoteStackPr| {
+            s.branches.iter().any(|b| b.pr_number() == Some(p.number) || b.branch == p.head.ref_name)
+        };
+        let Some(top) = remote.pull_requests.iter().rposition(tracked) else { continue };
+        let mut added = vec![];
+        for p in &remote.pull_requests[top + 1..] {
+            if p.merged_at.is_some() || !p.state.eq_ignore_ascii_case("open") {
+                continue;
+            }
+            let head = &p.head.ref_name;
+            if ctx.store.file.find(head).is_some() || ctx.store.file.find_pr(p.number).is_some() {
+                ui::warn(&format!(
+                    "#{} ({head}) is in GitHub stack #{} but another local stack tracks it; not adding it",
+                    p.number, s.number
+                ));
+                break;
+            }
+            // A branch `gt review` pulled down stops being read-only.
+            for key in [review_key(head), review_base_key(head)] {
+                let _ = git::run_raw(None, &["config", "--unset", &key], None, &[]);
+            }
+            added.push(BranchRef {
+                branch: head.clone(),
+                pull_request: Some(PrRef { number: p.number, url: ctx.gh()?.pr_url(p.number), ..Default::default() }),
+                ..Default::default()
+            });
+        }
+        if added.is_empty() {
+            continue;
+        }
+        ui::ok(&format!(
+            "tracking {} from GitHub stack #{}",
+            added.iter().map(|b| ui::bold(&b.branch)).collect::<Vec<_>>().join(", "),
+            s.number
+        ));
+        ctx.store.file.stacks[si].branches.extend(added);
+        changed = true;
+    }
+    if changed {
+        ctx.reload()?;
     }
     Ok(())
 }

@@ -95,6 +95,8 @@ const PR_FIELDS: &str = "number id url state isDraft title headRefName headRefOi
 pub struct RemoteStackPr {
     pub number: u64,
     #[serde(default)]
+    pub state: String,
+    #[serde(default)]
     pub merged_at: Option<String>,
     pub head: RemoteHead,
 }
