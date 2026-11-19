@@ -530,6 +530,86 @@ fn submit_skip_conflicts_submits_the_whole_stack_when_nothing_conflicts() {
     assert!(!out.stderr.contains("stay local"), "{out:?}");
 }
 
+/// feat-a ← feat-b ← feat-c, submitted, with feat-b amended so feat-b and feat-c need a push.
+fn submitted_with_b_amended() -> World {
+    let w = World::with_github();
+    w.create("feat-a", "a.rs", "a\n");
+    w.create("feat-b", "b.rs", "b\n");
+    w.create("feat-c", "c.rs", "c\n");
+    w.gt_ok(&["submit"]);
+    w.git(&["checkout", "--quiet", "feat-b"]);
+    w.write("b.rs", "b2\n");
+    w.gt_ok(&["modify", "-a"]);
+    w
+}
+
+#[test]
+fn submit_only_pushes_just_the_current_branch() {
+    let w = submitted_with_b_amended();
+    let (a, c) = (w.remote_head("feat-a"), w.remote_head("feat-c"));
+
+    let out = w.gt_ok(&["submit", "--only"]);
+    assert_eq!(w.remote_head("feat-b"), w.head("feat-b"));
+    assert_eq!((w.remote_head("feat-a"), w.remote_head("feat-c")), (a, c), "the others stay as they were");
+    assert_ne!(w.remote_head("feat-c"), w.head("feat-c"), "restacked locally");
+    assert!(out.stderr.contains("feat-c not pushed"), "{out:?}");
+    assert!(line_of(&out.stdout, "feat-b").contains("/pull/"), "{out:?}");
+    assert!(!out.stdout.contains("feat-a"), "{out:?}");
+}
+
+#[test]
+fn submit_only_opens_a_pr_for_a_new_branch_on_top() {
+    let w = submitted();
+    w.create("feat-c", "c.rs", "c\n");
+    w.git(&["checkout", "--quiet", "feat-a"]);
+    w.write("a.rs", "a2\n");
+    w.gt_ok(&["modify", "-a"]);
+    let a = w.remote_head("feat-a");
+    w.git(&["checkout", "--quiet", "feat-c"]);
+
+    let out = w.gt_ok(&["submit", "--only"]);
+    assert_eq!(w.gh().prs().len(), 3);
+    assert_eq!(w.gh().pr_for("feat-c").base, "feat-b");
+    assert_eq!(w.remote_head("feat-a"), a);
+    assert!(out.stderr.contains("feat-a, feat-b not pushed, so the PR for feat-c"), "{out:?}");
+}
+
+#[test]
+fn submit_only_refuses_when_a_branch_below_isnt_submitted() {
+    let w = World::with_github();
+    w.create("feat-a", "a.rs", "a\n");
+    w.create("feat-b", "b.rs", "b\n");
+
+    let out = w.gt_err(&["submit", "--only"]);
+    assert!(out.stderr.contains("feat-a isn't submitted yet"), "{out:?}");
+    assert!(w.gh().prs().is_empty());
+    assert_eq!(w.remote_head("feat-b"), None);
+}
+
+#[test]
+fn submit_only_skips_a_conflict_above() {
+    let w = World::with_github();
+    w.create("feat-a", "shared.rs", "one\n");
+    w.create("feat-b", "shared.rs", "two\n");
+    w.gt_ok(&["submit"]);
+    let b = w.head("feat-b").unwrap();
+    w.git(&["checkout", "--quiet", "feat-a"]);
+    w.write("shared.rs", "uno\n");
+    w.git(&["commit", "--quiet", "-a", "--amend", "--no-edit"]);
+
+    w.gt_ok(&["submit", "--only"]);
+    assert_eq!(w.remote_head("feat-a"), w.head("feat-a"));
+    assert_eq!(w.head("feat-b").as_deref(), Some(b.as_str()), "left where it was");
+    assert_eq!(w.config("branch.feat-b.gtNeedsRebase").as_deref(), Some(b.as_str()));
+    assert!(!w.common_dir().join("rebase-merge").exists());
+}
+
+#[test]
+fn submit_only_and_skip_conflicts_dont_mix() {
+    let w = submitted();
+    w.gt_err(&["submit", "--only", "--skip-conflicts"]);
+}
+
 #[test]
 fn sync_offline_never_calls_github() {
     let w = submitted();

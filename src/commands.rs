@@ -2058,13 +2058,21 @@ pub fn clear_merged(force: bool, diverged: bool) -> Result<()> {
 
 // ───────────────────────────── submit ─────────────────────────────
 
-pub fn submit(draft: bool, no_verify: bool, relink: bool, skip_conflicts: bool, prefer_local: bool) -> Result<()> {
+pub fn submit(
+    draft: bool,
+    no_verify: bool,
+    relink: bool,
+    skip_conflicts: bool,
+    only: bool,
+    prefer_local: bool,
+) -> Result<()> {
     let mut ctx = Ctx::new(true)?;
     let si = ctx.current_stack()?;
     // Submitting shares the current branch and everything below it with gh-stack;
     // local branches above it stay local. With `skip_conflicts` it's instead every
     // branch below the nearest one needing a rebase, wherever you are in the stack,
-    // and nothing from that branch up is touched, shared or not.
+    // and nothing from that branch up is touched, shared or not. With `only` it's
+    // the current branch alone, on branches below it that are already submitted.
     let stop = if skip_conflicts { Some(restack::run_below_conflict(&mut ctx, si)?) } else { None };
     if let Some(i) = stop {
         let stack = &ctx.store.file.stacks[si];
@@ -2076,19 +2084,50 @@ pub fn submit(draft: bool, no_verify: bool, relink: bool, skip_conflicts: bool, 
         }
     }
     let idx = ctx.store.file.stacks[si].index_of(ctx.current()?).unwrap();
+    if only {
+        let stack = &ctx.store.file.stacks[si];
+        let unsubmitted = stack
+            .active()
+            .take_while(|(i, _)| *i < idx)
+            .find(|(_, b)| b.local || !ctx.refs.remote.contains_key(&b.branch));
+        if let Some((_, b)) = unsubmitted {
+            bail!(
+                "{} isn't submitted yet, so there's nothing for {} to sit on; submit it first, or drop --only to submit both",
+                b.branch,
+                stack.branches[idx].branch
+            );
+        }
+    }
     for b in &mut ctx.store.file.stacks[si].branches[..stop.unwrap_or(idx + 1)] {
         b.local = false;
     }
-    if stop.is_none() && !restack::run(&mut ctx, si, false)? {
+    // With `only`, a conflict above the current branch doesn't hold it up: that branch is marked and left where it is.
+    let conflict_above = only && {
+        let first = restack::plan(&ctx, si, false, false)?.conflicts.into_iter().next();
+        first.and_then(|c| ctx.store.file.stacks[si].index_of(&c.branch)).is_some_and(|i| i > idx)
+    };
+    if conflict_above {
+        restack::run_skipping(&mut ctx, si, false)?;
+    } else if stop.is_none() && !restack::run(&mut ctx, si, false)? {
         ctx.save()?;
         journal::exit(1);
     }
-    let in_scope = |i: usize| stop.is_none_or(|s| i < s);
+    let in_scope = |i: usize| if only { i == idx } else { stop.is_none_or(|s| i < s) };
 
     let (repo_id, prs) = fetch_prs(&ctx, &[si], false)?;
     let stack = &ctx.store.file.stacks[si];
-    let to_push: Vec<String> =
-        needs_push(&ctx, si).into_iter().filter(|b| stack.index_of(b).is_some_and(in_scope)).collect();
+    let (to_push, unpushed): (Vec<String>, Vec<String>) =
+        needs_push(&ctx, si).into_iter().partition(|b| stack.index_of(b).is_some_and(in_scope));
+    if only {
+        let below: Vec<&String> = unpushed.iter().filter(|b| stack.index_of(b).is_some_and(|i| i < idx)).collect();
+        if !below.is_empty() {
+            ui::warn(&format!(
+                "{} not pushed, so the PR for {} may show their changes too",
+                below.iter().map(|b| ui::bold(b)).collect::<Vec<_>>().join(", "),
+                ui::bold(&stack.branches[idx].branch)
+            ));
+        }
+    }
     let moved = moved_since_sync(&ctx, &to_push)?;
     if !moved.is_empty() && !prefer_local {
         bail!(
@@ -2160,7 +2199,7 @@ pub fn submit(draft: bool, no_verify: bool, relink: bool, skip_conflicts: bool, 
 
     let gh = ctx.gh()?;
     let stack = &ctx.store.file.stacks[si];
-    for (_, b) in stack.shared().collect::<Vec<_>>().into_iter().rev() {
+    for (_, b) in stack.shared().filter(|(i, _)| !only || *i == idx).collect::<Vec<_>>().into_iter().rev() {
         if let Some(n) = b.pr_number() {
             outln!("{:<40} {}", b.branch, gh.pr_url(n));
         }
@@ -2171,6 +2210,13 @@ pub fn submit(draft: bool, no_verify: bool, relink: bool, skip_conflicts: bool, 
             ui::bold(&b.branch)
         ));
         return Ok(());
+    }
+    if only {
+        let above: Vec<String> =
+            unpushed.iter().filter(|b| stack.index_of(b).is_some_and(|i| i > idx)).map(|b| ui::bold(b)).collect();
+        if !above.is_empty() {
+            ui::info(&format!("{} not pushed; run `gt submit` without --only to push them", above.join(", ")));
+        }
     }
     let above: Vec<String> = stack.active().filter(|(_, b)| b.local).map(|(_, b)| ui::bold(&b.branch)).collect();
     if !above.is_empty() {

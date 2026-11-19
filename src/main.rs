@@ -125,8 +125,12 @@ enum Cmd {
         #[arg(long)]
         relink: bool,
         /// Submit every branch below the nearest one needing a rebase, from anywhere in the stack
-        #[arg(long)]
+        #[arg(long, conflicts_with = "only")]
         skip_conflicts: bool,
+        /// Push and create or retarget the PR for the current branch alone; the branches below
+        /// it must already be submitted
+        #[arg(long)]
+        only: bool,
         /// Push branches that changed on the remote since gt last synced, overwriting what's there
         #[arg(long)]
         prefer_local: bool,
@@ -269,8 +273,8 @@ fn main() {
         Cmd::Sync { all, no_prune, prefer_remote, offline } => {
             commands::sync(commands::SyncOpts { all, no_prune, prefer_remote, offline })
         }
-        Cmd::Submit { draft, no_verify, relink, skip_conflicts, prefer_local } => {
-            commands::submit(draft, no_verify, relink, skip_conflicts, prefer_local)
+        Cmd::Submit { draft, no_verify, relink, skip_conflicts, only, prefer_local } => {
+            commands::submit(draft, no_verify, relink, skip_conflicts, only, prefer_local)
         }
         Cmd::Get { target } => commands::get(target),
         Cmd::Track { branches, trunk } => commands::track(branches, trunk),
