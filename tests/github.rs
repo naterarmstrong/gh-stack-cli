@@ -128,6 +128,41 @@ fn submit_wont_overwrite_a_push_it_never_saw() {
 }
 
 #[test]
+fn submit_prefer_local_overwrites_a_push_sync_kept_local_over() {
+    let w = submitted();
+    w.teammate_push("feat-a", "a.rs", "theirs\n", true);
+    w.gt_ok(&["bottom"]);
+    w.write("a.rs", "mine\n");
+    w.gt_ok(&["modify", "-a"]);
+
+    // Sync keeps local and points at both ways out, not at a plain submit that would refuse.
+    let out = w.gt_ok(&["sync"]);
+    assert!(out.stderr.contains("`gt submit --prefer-local`"), "{out:?}");
+    assert!(!out.stderr.contains("feat-a changed locally"), "{out:?}");
+    let out = w.gt_err(&["submit"]);
+    assert!(out.stderr.contains("--prefer-local"), "{out:?}");
+
+    let out = w.gt_ok(&["submit", "--prefer-local"]);
+    assert!(out.stderr.contains("overwriting feat-a on origin"), "{out:?}");
+    assert_eq!(w.remote_head("feat-a"), w.head("feat-a"));
+    assert_eq!(w.show(&w.remote_head("feat-a").unwrap(), "a.rs").as_deref(), Some("mine\n"));
+}
+
+#[test]
+fn submit_prefer_local_wont_overwrite_a_push_it_never_fetched() {
+    let w = submitted();
+    w.teammate_push("feat-a", "a.rs", "theirs\n", true);
+    w.gt_ok(&["bottom"]);
+    w.write("a.rs", "mine\n");
+    w.gt_ok(&["modify", "-a"]);
+    w.gt_ok(&["sync"]);
+    let late = w.teammate_push("feat-a", "a.rs", "later\n", true);
+
+    w.gt_err(&["submit", "--prefer-local"]);
+    assert_eq!(w.remote_head("feat-a").as_deref(), Some(late.as_str()));
+}
+
+#[test]
 fn sync_prunes_a_merged_bottom_and_restacks_onto_trunk() {
     let w = submitted();
     let landed = w.merge_pr(1);

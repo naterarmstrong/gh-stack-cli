@@ -1563,14 +1563,13 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
             Err(e) => ui::warn(&format!("couldn't read push history from GitHub: {e:#}")),
         }
     }
+    let mut diverged = vec![];
     for p in pulls {
         if p.stale || (p.moved && opts.prefer_remote) {
             adopt_remote(&mut ctx, &p.branch, &p.parent_ref, &p.below)?;
         } else if p.moved {
-            ui::warn(&format!(
-                "{} changed both locally and on {} — keeping local (use --prefer-remote to take theirs)",
-                p.branch, ctx.remote
-            ));
+            ui::warn(&format!("{} changed both locally and on {} — keeping local", p.branch, ctx.remote));
+            diverged.push(p.branch);
         }
     }
     ctx.reload()?;
@@ -1625,8 +1624,11 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
     }
 
     // Sync never pushes; `gt submit` does, once you've looked at the result.
-    let unpushed: Vec<String> =
-        restacked.iter().flat_map(|&si| needs_push(&ctx, si)).filter(|b| ctx.refs.remote.contains_key(b)).collect();
+    let unpushed: Vec<String> = restacked
+        .iter()
+        .flat_map(|&si| needs_push(&ctx, si))
+        .filter(|b| ctx.refs.remote.contains_key(b) && !diverged.contains(b))
+        .collect();
 
     restack::record_heads(&mut ctx);
     ctx.save()?;
@@ -1657,6 +1659,14 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         errln!(
             "\n{} changed locally and aren't pushed; `gt submit` pushes them.",
             unpushed.iter().map(|b| ui::bold(b)).collect::<Vec<_>>().join(", ")
+        );
+    }
+    // Submit won't push these until one side wins.
+    if !diverged.is_empty() {
+        errln!(
+            "\n{} changed both locally and on {}; `gt sync --prefer-remote` takes theirs, `gt submit --prefer-local` overwrites them with yours.",
+            diverged.iter().map(|b| ui::bold(b)).collect::<Vec<_>>().join(", "),
+            ctx.remote
         );
     }
     Ok(())
@@ -2048,7 +2058,7 @@ pub fn clear_merged(force: bool, diverged: bool) -> Result<()> {
 
 // ───────────────────────────── submit ─────────────────────────────
 
-pub fn submit(draft: bool, no_verify: bool, relink: bool, skip_conflicts: bool) -> Result<()> {
+pub fn submit(draft: bool, no_verify: bool, relink: bool, skip_conflicts: bool, prefer_local: bool) -> Result<()> {
     let mut ctx = Ctx::new(true)?;
     let si = ctx.current_stack()?;
     // Submitting shares the current branch and everything below it with gh-stack;
@@ -2080,12 +2090,16 @@ pub fn submit(draft: bool, no_verify: bool, relink: bool, skip_conflicts: bool) 
     let to_push: Vec<String> =
         needs_push(&ctx, si).into_iter().filter(|b| stack.index_of(b).is_some_and(in_scope)).collect();
     let moved = moved_since_sync(&ctx, &to_push)?;
-    if !moved.is_empty() {
+    if !moved.is_empty() && !prefer_local {
         bail!(
-            "{} changed on {} since gt last synced; run `gt sync` to take or reconcile those changes before pushing",
+            "{} changed on {} since gt last synced; run `gt sync` to take those changes, or `gt submit --prefer-local` to overwrite them",
             moved.join(", "),
             ctx.remote
         );
+    }
+    // The lease is still the remote commit gt fetched, so a push made after that fails instead of being lost.
+    for b in &moved {
+        ui::warn(&format!("overwriting {b} on {} with the local branch", ctx.remote));
     }
     push(&mut ctx, &to_push, no_verify)?;
     ctx.reload()?;

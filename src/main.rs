@@ -127,6 +127,9 @@ enum Cmd {
         /// Submit every branch below the nearest one needing a rebase, from anywhere in the stack
         #[arg(long)]
         skip_conflicts: bool,
+        /// Push branches that changed on the remote since gt last synced, overwriting what's there
+        #[arg(long)]
+        prefer_local: bool,
     },
     /// Pull down a stack from GitHub by PR number, URL, or branch
     Get { target: String },
@@ -266,8 +269,8 @@ fn main() {
         Cmd::Sync { all, no_prune, prefer_remote, offline } => {
             commands::sync(commands::SyncOpts { all, no_prune, prefer_remote, offline })
         }
-        Cmd::Submit { draft, no_verify, relink, skip_conflicts } => {
-            commands::submit(draft, no_verify, relink, skip_conflicts)
+        Cmd::Submit { draft, no_verify, relink, skip_conflicts, prefer_local } => {
+            commands::submit(draft, no_verify, relink, skip_conflicts, prefer_local)
         }
         Cmd::Get { target } => commands::get(target),
         Cmd::Track { branches, trunk } => commands::track(branches, trunk),
