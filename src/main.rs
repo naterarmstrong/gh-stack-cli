@@ -50,7 +50,8 @@ enum Cmd {
     Bottom,
     /// Check out the stack's trunk
     Trunk,
-    /// Check out a branch by name or PR number (interactive picker if omitted)
+    /// Check out a branch by name or PR number, or `-` for the last branch you were on
+    /// (interactive picker if omitted)
     #[command(visible_alias = "co")]
     Checkout { target: Option<String> },
     /// Create a branch above the current one and commit staged changes to it

@@ -85,7 +85,7 @@ One commit per branch is the simple case, and nothing changes for it. When a bra
 | `gt up [n]` (`u`) / `gt down [n]` (`d`) | Check out the branch `n` above or below (default 1). |
 | `gt top` (`t`) / `gt bottom` (`b`) | Check out the top or bottom of the stack. |
 | `gt trunk` | Check out the stack's trunk. |
-| `gt checkout [target]` (`co`) | Check out by branch name or PR number. With no target, opens an interactive picker. |
+| `gt checkout [target]` (`co`) | Check out by branch name or PR number, or `-` for the last branch you were on (skipping ones deleted since). With no target, opens an interactive picker. |
 
 ### Editing
 

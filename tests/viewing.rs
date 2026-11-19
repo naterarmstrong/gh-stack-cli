@@ -105,6 +105,30 @@ fn checkout_takes_a_branch_or_a_tracked_pr() {
 }
 
 #[test]
+fn checkout_dash_goes_back_to_the_last_branch() {
+    let w = three_branches();
+    w.gt_ok(&["bottom"]);
+    w.gt_ok(&["co", "-"]);
+    assert_eq!(w.current(), "feat-c");
+    w.gt_ok(&["checkout", "-"]);
+    assert_eq!(w.current(), "feat-a");
+
+    // A plain git switch counts too, and a branch deleted since is skipped.
+    w.git(&["checkout", "--quiet", "feat-b"]);
+    w.git(&["checkout", "--quiet", "main"]);
+    w.git(&["branch", "-D", "feat-b"]);
+    w.gt_ok(&["co", "-"]);
+    assert_eq!(w.current(), "feat-a");
+}
+
+#[test]
+fn checkout_dash_without_a_previous_branch_is_an_error() {
+    let w = World::new();
+    let out = w.gt_err(&["co", "-"]);
+    assert!(out.stderr.contains("no previous branch"), "{out:?}");
+}
+
+#[test]
 fn checkout_refuses_a_branch_in_another_worktree() {
     let w = three_branches();
     w.git(&["checkout", "--quiet", "main"]);

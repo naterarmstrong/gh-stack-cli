@@ -725,6 +725,7 @@ fn parse_pr(target: &str) -> Option<u64> {
 pub fn checkout_cmd(target: Option<String>) -> Result<()> {
     let ctx = Ctx::new(false)?;
     let branch = match target {
+        Some(t) if t == "-" => previous_branch(&ctx)?,
         Some(t) => resolve_branch(&ctx, &t)?,
         None => {
             let sis = stacks_to_show(&ctx, true);
@@ -732,6 +733,21 @@ pub fn checkout_cmd(target: Option<String>) -> Result<()> {
         }
     };
     checkout(&ctx, &branch)
+}
+
+/// The branch most recently switched away from, per HEAD's reflog, skipping
+/// ones since deleted and the current branch, like `git checkout -` but past
+/// branches that are gone.
+fn previous_branch(ctx: &Ctx) -> Result<String> {
+    let repo = git::open()?;
+    let cur = ctx.info.current_branch.as_deref();
+    history::reflog(&repo, "HEAD")
+        .iter()
+        .rev()
+        .filter_map(|e| e.message.strip_prefix("checkout: moving from ")?.split_once(" to ").map(|(from, _)| from))
+        .find(|b| Some(*b) != cur && ctx.refs.heads.contains_key(*b))
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("no previous branch to switch back to"))
 }
 
 /// Interactive branch picker over the `gt ls` graph, starting on the current branch.
