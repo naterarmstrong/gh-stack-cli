@@ -237,7 +237,7 @@ impl State {
                     "number": p.number,
                     "state": if p.state == "OPEN" { "open" } else { "closed" },
                     "merged_at": (p.state == "MERGED").then_some("2026-01-01T00:00:00Z"),
-                    "head": { "ref": p.head },
+                    "head": { "ref": p.head, "sha": self.head_of(p) },
                 })
             })
             .collect();

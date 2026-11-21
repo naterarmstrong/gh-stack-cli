@@ -321,3 +321,107 @@ fn cloud_wont_track_a_fork_pr() {
     let out = w.gt_err(&["cloud", &n.to_string()]);
     assert!(out.stderr.contains("is from a fork"), "{out:?}");
 }
+
+/// r1 ← r2 ← r3 on main, stacked on GitHub, pulled down by reviewing r2.
+fn reviewed_stack() -> (World, [u64; 3]) {
+    let w = World::with_github();
+    let r1 = their_pr(&w, "r1", "main", "r1.rs");
+    let r2 = their_pr(&w, "r2", "r1", "r2.rs");
+    let r3 = their_pr(&w, "r3", "r2", "r3.rs");
+    w.gh().add_stack(&[r1, r2, r3]);
+    w.gt_ok(&["review", &r2.to_string()]);
+    (w, [r1, r2, r3])
+}
+
+#[test]
+fn up_down_top_bottom_and_trunk_walk_a_review_stack() {
+    let (w, _) = reviewed_stack();
+    assert_eq!(w.current(), "r2");
+    w.gt_ok(&["up"]);
+    assert_eq!(w.current(), "r3");
+    w.gt_ok(&["down", "2"]);
+    assert_eq!(w.current(), "r1");
+    w.gt_ok(&["down"]);
+    assert_eq!(w.current(), "main", "below the bottom is the branch the stack sits on");
+    w.git(&["checkout", "--quiet", "r1"]);
+    w.gt_ok(&["top"]);
+    assert_eq!(w.current(), "r3");
+    w.gt_ok(&["up"]);
+    assert_eq!(w.current(), "r3", "up stops at the top");
+    w.gt_ok(&["bottom"]);
+    assert_eq!(w.current(), "r1");
+    w.git(&["checkout", "--quiet", "r3"]);
+    w.gt_ok(&["trunk"]);
+    assert_eq!(w.current(), "main");
+}
+
+#[test]
+fn up_names_the_branches_where_a_review_stack_forks() {
+    let w = World::with_github();
+    let r1 = their_pr(&w, "r1", "main", "r1.rs");
+    their_pr(&w, "left", "r1", "l.rs");
+    their_pr(&w, "right", "r1", "r.rs");
+    w.gt_ok(&["review", &r1.to_string()]);
+    let out = w.gt_err(&["up"]);
+    assert!(out.stderr.contains("forks above r1: left, right"), "{out:?}");
+    w.git(&["checkout", "--quiet", "left"]);
+    w.gt_ok(&["down"]);
+    assert_eq!(w.current(), "r1");
+}
+
+#[test]
+fn review_records_the_github_stack_in_gh_stack_state() {
+    let (w, [r1, r2, r3]) = reviewed_stack();
+    let st = w.state();
+    let stacks = st["stacks"].as_array().unwrap();
+    assert_eq!(stacks.len(), 1, "{st}");
+    let s = &stacks[0];
+    assert_eq!(s["number"], w.gh().stacks()[0].number);
+    assert_eq!(s["trunk"]["branch"], "main");
+    let names: Vec<&str> = s["branches"].as_array().unwrap().iter().map(|b| b["branch"].as_str().unwrap()).collect();
+    assert_eq!(names, ["r1", "r2", "r3"]);
+    for (i, (b, n)) in [("r1", r1), ("r2", r2), ("r3", r3)].into_iter().enumerate() {
+        let e = &s["branches"][i];
+        assert_eq!(e["head"].as_str(), w.head(b).as_deref(), "{b}");
+        assert_eq!(e["pullRequest"]["number"], n);
+        assert_eq!(e["pullRequest"]["id"], format!("PR_{n}"));
+    }
+    assert_eq!(s["branches"][1]["base"].as_str(), w.head("r1").as_deref());
+    assert_eq!(st["repository"].as_str().map(|r| r.ends_with("acme/widgets")), Some(true), "{st}");
+    assert_eq!(w.local_state()["reviews"][0], s["id"], "gt remembers it's a review stack");
+
+    // It is still a review stack to gt: listed under Reviewing, never restacked or pushed.
+    let ls = w.gt_ok(&["ls"]);
+    let before_reviewing = ls.stdout.split("Reviewing").next().unwrap();
+    assert!(!before_reviewing.contains("r2"), "{ls:?}");
+    let out = w.gt_err(&["submit"]);
+    assert!(out.stderr.contains("not part of a stack"), "{out:?}");
+    w.gh().clear_requests();
+    w.advance_main("other.rs", "moved on\n");
+    let out = w.gt_ok(&["sync"]);
+    assert!(!out.all().contains("restacked") && !out.all().contains("gt submit"), "{out:?}");
+    assert_eq!(w.head("r2"), w.remote_head("r2"));
+}
+
+#[test]
+fn sync_keeps_the_recorded_review_stack_current() {
+    let (w, [r1, ..]) = reviewed_stack();
+    let theirs = w.teammate_push("r3", "r3.rs", "rewritten\n", true);
+    w.merge_pr(r1);
+    w.gt_ok(&["sync"]);
+    assert_eq!(w.head("r1"), None, "merged review branch pruned");
+    let s = &w.state()["stacks"][0];
+    assert_eq!(s["branches"][0]["pullRequest"]["merged"], true);
+    assert_eq!(s["branches"][2]["head"].as_str(), Some(theirs.as_str()));
+}
+
+#[test]
+fn a_gh_stack_checkout_of_review_branches_is_a_review_stack() {
+    let (w, _) = reviewed_stack();
+    // As `gh stack checkout` leaves it: the stack in gh-stack, gt's record of it gone.
+    w.write_local_state(&serde_json::json!({ "schemaVersion": 1, "stacks": [] }));
+    let ls = w.gt_ok(&["ls"]);
+    assert!(!ls.stdout.split("Reviewing").next().unwrap().contains("r2"), "{ls:?}");
+    w.gt_ok(&["review", "2"]);
+    assert_eq!(w.state()["stacks"].as_array().unwrap().len(), 1, "re-recorded, not duplicated");
+}

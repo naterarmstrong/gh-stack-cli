@@ -126,9 +126,10 @@ impl Ctx {
         let repo = git::open()?;
         let info = git::repo_info(&repo)?;
         let lock = if mutating { Some(Lock::acquire(&info.common_dir)?) } else { None };
-        let store = Store::load(&info.common_dir)?;
-        let remote = std::env::var("GT_REMOTE").unwrap_or_else(|_| "origin".into());
         let mut reviews = reviews(&repo);
+        let marked: HashSet<String> = reviews.iter().map(|r| r.branch.clone()).collect();
+        let store = Store::load(&info.common_dir, &marked)?;
+        let remote = std::env::var("GT_REMOTE").unwrap_or_else(|_| "origin".into());
         let tracked = tracked(&store, &reviews);
         let refs = Refs::load(&repo, &remote, &tracked)?;
         reviews.retain(|r| refs.heads.contains_key(&r.branch));

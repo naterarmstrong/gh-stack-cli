@@ -7,10 +7,17 @@
 //! branches on top of a gh-stack stack (`on` names the branch they sit on).
 //! Both files load into one list of stacks, with each local branch marked
 //! `local`, and are split back apart on save.
+//!
+//! gh-stack stacks of someone else's PRs pulled down with `gt review` (as
+//! `gh stack checkout` would record them) are kept apart in `Store::reviews`,
+//! so nothing that works on your own stacks ever restacks or pushes them.
+//! `.git/gt-stack` lists their ids (`reviews`) so they stay apart even after
+//! a review branch's config is gone.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -177,6 +184,9 @@ struct LocalFile {
     schema_version: u32,
     #[serde(default)]
     stacks: Vec<LocalStack>,
+    /// Ids of the gh-stack stacks that are review stacks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reviews: Vec<String>,
     #[serde(flatten)]
     extra: Map<String, Value>,
 }
@@ -244,13 +254,16 @@ impl Disk {
 pub struct Store {
     /// Every stack, gh-stack's first, with gt's local branches merged in.
     pub file: StackFile,
+    /// gh-stack stacks of PRs pulled down with `gt review`, kept out of `file`.
+    pub reviews: Vec<Stack>,
     gh: Disk,
     local: Disk,
     local_extra: Map<String, Value>,
 }
 
 impl Store {
-    pub fn load(common_dir: &Path) -> Result<Store> {
+    /// `review_branches` are the branches marked as pulled down by `gt review`.
+    pub fn load(common_dir: &Path, review_branches: &HashSet<String>) -> Result<Store> {
         let (gh, file) = Disk::read::<StackFile>(common_dir.join("gh-stack"))?;
         let mut file = file.unwrap_or(StackFile {
             schema_version: 1,
@@ -262,10 +275,19 @@ impl Store {
             bail!(".git/gh-stack has schema version {}; gt understands 1", file.schema_version);
         }
         let (local, mine) = Disk::read::<LocalFile>(common_dir.join("gt-stack"))?;
-        let mine = mine.unwrap_or(LocalFile { schema_version: 1, stacks: vec![], extra: Map::new() });
+        let mine = mine.unwrap_or(LocalFile { schema_version: 1, stacks: vec![], reviews: vec![], extra: Map::new() });
         if mine.schema_version > 1 {
             bail!(".git/gt-stack has schema version {}; gt understands 1", mine.schema_version);
         }
+        // A review stack is one gt recorded as such, or one `gh stack checkout`
+        // pulled down whose open branches are all review branches.
+        let is_review = |s: &Stack| {
+            (!s.id.is_empty() && mine.reviews.contains(&s.id))
+                || (s.branches.iter().any(|b| review_branches.contains(&b.branch))
+                    && s.branches.iter().all(|b| b.merged() || review_branches.contains(&b.branch)))
+        };
+        let (reviews, stacks): (Vec<Stack>, Vec<Stack>) = file.stacks.drain(..).partition(|s| is_review(s));
+        file.stacks = stacks;
         for ls in mine.stacks {
             // A branch gh-stack also tracks now (say, `gh stack add`) belongs to gh-stack.
             let branches: Vec<BranchRef> = ls
@@ -287,14 +309,19 @@ impl Store {
                 }),
             }
         }
-        Ok(Store { file, gh, local, local_extra: mine.extra })
+        Ok(Store { file, reviews, gh, local, local_extra: mine.extra })
     }
 
     pub fn save(&mut self, _lock: &Lock) -> Result<()> {
         self.gh.check()?;
         self.local.check()?;
         let mut gh = StackFile { stacks: vec![], ..self.file.clone() };
-        let mut mine = LocalFile { schema_version: 1, stacks: vec![], extra: self.local_extra.clone() };
+        let mut mine = LocalFile {
+            schema_version: 1,
+            stacks: vec![],
+            reviews: self.reviews.iter().map(|s| s.id.clone()).filter(|id| !id.is_empty()).collect(),
+            extra: self.local_extra.clone(),
+        };
         for s in &self.file.stacks {
             // gh-stack can't hold a branch above one it doesn't know, so everything at or
             // below the highest shared branch is shared.
@@ -312,9 +339,10 @@ impl Store {
                 });
             }
         }
+        gh.stacks.extend(self.reviews.iter().cloned());
         let empty = gh.stacks.is_empty();
         self.gh.write(&gh, empty)?;
-        let empty = mine.stacks.is_empty();
+        let empty = mine.stacks.is_empty() && mine.reviews.is_empty();
         self.local.write(&mine, empty)
     }
 }

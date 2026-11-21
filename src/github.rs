@@ -105,6 +105,8 @@ pub struct RemoteStackPr {
 pub struct RemoteHead {
     #[serde(rename = "ref")]
     pub ref_name: String,
+    #[serde(default)]
+    pub sha: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
