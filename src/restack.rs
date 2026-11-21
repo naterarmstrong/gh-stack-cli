@@ -30,6 +30,9 @@ pub struct Plan {
     pub conflicts: Vec<Conflict>,
     /// Branches that were checked and replay cleanly (moved or not).
     pub clean: Vec<String>,
+    /// Branches that would have moved but were held where they are, each with
+    /// the commit its own commits sit on.
+    pub held: Vec<(String, String)>,
 }
 
 /// Computes new commits for every unmerged branch in stack `si`. When
@@ -40,11 +43,19 @@ pub struct Plan {
 /// conflicting branch is left where it is and the branches above it are
 /// replayed onto it instead.
 pub fn plan(ctx: &Ctx, si: usize, onto_trunk: bool, skip_conflicts: bool) -> Result<Plan> {
-    plan_below(ctx, si, onto_trunk, skip_conflicts, ctx.store.file.stacks[si].branches.len())
+    plan_below(ctx, si, onto_trunk, skip_conflicts, &[], ctx.store.file.stacks[si].branches.len())
 }
 
-/// `plan`, for only the branches of stack `si` below index `end`.
-fn plan_below(ctx: &Ctx, si: usize, onto_trunk: bool, skip_conflicts: bool, end: usize) -> Result<Plan> {
+/// `plan`, for only the branches of stack `si` below index `end`. A branch in
+/// `hold` never moves; the branches above it are replayed onto it where it is.
+fn plan_below(
+    ctx: &Ctx,
+    si: usize,
+    onto_trunk: bool,
+    skip_conflicts: bool,
+    hold: &[String],
+    end: usize,
+) -> Result<Plan> {
     let stack = &ctx.store.file.stacks[si];
     let mut parent: Option<(String, String)> =
         if onto_trunk { Some((stack.trunk.branch.clone(), ctx.trunk_tip(&stack.trunk.branch)?)) } else { None };
@@ -52,6 +63,7 @@ fn plan_below(ctx: &Ctx, si: usize, onto_trunk: bool, skip_conflicts: bool, end:
     let mut updates = vec![];
     let mut conflicts = vec![];
     let mut clean = vec![];
+    let mut held = vec![];
     let mut below = below_seed(ctx, stack);
 
     for b in stack.branches[..end].iter() {
@@ -63,6 +75,8 @@ fn plan_below(ctx: &Ctx, si: usize, onto_trunk: bool, skip_conflicts: bool, end:
             bail!("branch {} is in the stack but missing locally (try `gt get` or `gt sync`)", b.branch);
         };
         below.extend(ctx.rebase_base(&b.branch).map(str::to_string));
+        // Where its own commits start, if it has any; held branches record it.
+        let mut own_base = c.sha.clone();
         let Some((parent_name, parent_tip)) = parent.clone() else {
             below.extend([b.head.clone(), c.sha.clone()]);
             parent = Some((b.branch.clone(), c.sha.clone()));
@@ -84,6 +98,12 @@ fn plan_below(ctx: &Ctx, si: usize, onto_trunk: bool, skip_conflicts: bool, end:
                 // Nothing of its own above what's below it: it follows its parent.
                 None => parent_tip.clone(),
                 Some((_, p)) if p[0] == parent_tip => c.sha.clone(),
+                // A held branch that would be replayed would move: skip the replay (and any
+                // conflict mark) and let the hold below keep it where it is.
+                Some((_, p)) if hold.contains(&b.branch) => {
+                    own_base = p[0].clone();
+                    String::new()
+                }
                 Some((_, p)) => {
                     let base = p[0].clone();
                     match replay(&own, &parent_tip)? {
@@ -97,7 +117,7 @@ fn plan_below(ctx: &Ctx, si: usize, onto_trunk: bool, skip_conflicts: bool, end:
                                 files,
                             });
                             if !skip_conflicts {
-                                return Ok(Plan { updates, conflicts, clean });
+                                return Ok(Plan { updates, conflicts, clean, held });
                             }
                             // Leave it where it is; the branches above follow it there.
                             below.extend([b.head.clone(), c.sha.clone()]);
@@ -109,6 +129,14 @@ fn plan_below(ctx: &Ctx, si: usize, onto_trunk: bool, skip_conflicts: bool, end:
                 }
             }
         };
+        if hold.contains(&b.branch) && new != c.sha {
+            // Left where it is, like a skipped conflict, but unmarked.
+            held.push((b.branch.clone(), own_base));
+            below.extend([b.head.clone(), c.sha.clone()]);
+            old_parent_head = Some(c.sha.clone());
+            parent = Some((b.branch.clone(), c.sha.clone()));
+            continue;
+        }
         clean.push(b.branch.clone());
         if new != c.sha {
             updates.push(Update { branch: b.branch.clone(), old: c.sha.clone(), new: new.clone() });
@@ -117,7 +145,7 @@ fn plan_below(ctx: &Ctx, si: usize, onto_trunk: bool, skip_conflicts: bool, end:
         old_parent_head = Some(c.sha.clone());
         parent = Some((b.branch.clone(), new));
     }
-    Ok(Plan { updates, conflicts, clean })
+    Ok(Plan { updates, conflicts, clean, held })
 }
 
 /// Replays a branch's own commits (oldest first, each with its parents) onto
@@ -246,11 +274,16 @@ pub fn run(ctx: &mut Ctx, si: usize, onto_trunk: bool) -> Result<bool> {
 }
 
 /// Restacks everything that replays cleanly and leaves each conflicting
-/// branch where it is, marked as needing a rebase. Returns the skipped branches.
-pub fn run_skipping(ctx: &mut Ctx, si: usize, onto_trunk: bool) -> Result<Vec<String>> {
-    let plan = plan(ctx, si, onto_trunk, true)?;
+/// branch where it is, marked as needing a rebase, and each branch in `hold`
+/// where it is, unmarked. Returns the skipped branches and the held ones that
+/// would have moved.
+pub fn run_skipping(ctx: &mut Ctx, si: usize, onto_trunk: bool, hold: &[String]) -> Result<(Vec<String>, Vec<String>)> {
+    let plan = plan_below(ctx, si, onto_trunk, true, hold, ctx.store.file.stacks[si].branches.len())?;
     apply(ctx, &plan.updates)?;
     clear_marks(ctx, &plan.clean);
+    for (b, base) in &plan.held {
+        ctx.mark_held(b, base)?;
+    }
     for c in &plan.conflicts {
         ctx.mark_needs_rebase(&c.branch, Some(&c.base))?;
         ui::warn(&format!(
@@ -260,7 +293,7 @@ pub fn run_skipping(ctx: &mut Ctx, si: usize, onto_trunk: bool) -> Result<Vec<St
             c.files.iter().map(|f| format!("    {}", ui::red(f))).collect::<Vec<_>>().join("\n")
         ));
     }
-    Ok(plan.conflicts.into_iter().map(|c| c.branch).collect())
+    Ok((plan.conflicts.into_iter().map(|c| c.branch).collect(), plan.held.into_iter().map(|(b, _)| b).collect()))
 }
 
 /// Restacks the branches below the nearest one that needs a rebase or would
@@ -269,7 +302,7 @@ pub fn run_skipping(ctx: &mut Ctx, si: usize, onto_trunk: bool) -> Result<Vec<St
 pub fn run_below_conflict(ctx: &mut Ctx, si: usize) -> Result<usize> {
     let stack = &ctx.store.file.stacks[si];
     let marked = stack.active().find(|(_, b)| ctx.needs_rebase(&b.branch)).map_or(stack.branches.len(), |(i, _)| i);
-    let plan = plan_below(ctx, si, false, false, marked)?;
+    let plan = plan_below(ctx, si, false, false, &[], marked)?;
     let stop = plan.conflicts.first().and_then(|c| stack.index_of(&c.branch)).unwrap_or(marked);
     apply(ctx, &plan.updates)?;
     clear_marks(ctx, &plan.clean);
@@ -282,6 +315,7 @@ pub fn run_below_conflict(ctx: &mut Ctx, si: usize) -> Result<usize> {
 fn clear_marks(ctx: &mut Ctx, branches: &[String]) {
     for b in branches {
         ctx.clear_needs_rebase(b);
+        ctx.clear_held(b);
     }
 }
 

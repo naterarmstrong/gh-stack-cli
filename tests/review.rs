@@ -75,6 +75,22 @@ fn sync_resets_review_branches_to_the_pr_head() {
 }
 
 #[test]
+fn sync_leaves_a_review_branch_checked_out_in_another_worktree() {
+    let w = World::with_github();
+    let n = their_pr(&w, "their-feature", "main", "t.rs");
+    w.gt_ok(&["rv", &n.to_string()]);
+    let mine = w.head("their-feature").unwrap();
+    w.git(&["checkout", "--quiet", "main"]);
+    let wt = w.tmp.path().join("wt");
+    w.git(&["worktree", "add", "--quiet", wt.to_str().unwrap(), "their-feature"]);
+    w.teammate_push("their-feature", "t.rs", "rewritten\n", true);
+
+    let out = w.gt_ok(&["sync"]);
+    assert_eq!(w.head("their-feature").as_deref(), Some(mine.as_str()), "{out:?}");
+    assert!(out.stderr.contains(&format!("their-feature in {}", wt.display())), "{out:?}");
+}
+
+#[test]
 fn sync_deletes_a_review_branch_once_its_pr_merges() {
     let w = World::with_github();
     let n = their_pr(&w, "their-feature", "main", "t.rs");

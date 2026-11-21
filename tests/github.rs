@@ -636,6 +636,74 @@ fn sync_only_touches_the_current_stack_unless_all() {
     assert_eq!(w.parent("feat-a"), landed);
 }
 
+/// Checks `branch` out in a new worktree and gives its path.
+fn worktree(w: &World, name: &str, branch: &str) -> PathBuf {
+    let wt = w.tmp.path().join(name);
+    w.git(&["worktree", "add", "--quiet", wt.to_str().unwrap(), branch]);
+    wt
+}
+
+#[test]
+fn sync_leaves_a_trunk_checked_out_in_another_worktree() {
+    let w = submitted();
+    let wt = worktree(&w, "wt", "main");
+    let old_main = w.head("main").unwrap();
+    let landed = w.advance_main("m.rs", "m\n");
+
+    let out = w.gt_ok(&["sync"]);
+    assert_eq!(w.head("main").as_deref(), Some(old_main.as_str()), "trunk in another worktree left alone");
+    assert!(!wt.join("m.rs").exists(), "{out:?}");
+    assert_eq!(w.parent("feat-a"), landed, "the stack still restacks onto the remote trunk");
+    assert!(out.stderr.contains("checked out in another worktree"), "{out:?}");
+    assert!(out.stderr.contains(&format!("main in {}", wt.display())), "{out:?}");
+}
+
+#[test]
+fn sync_restacks_around_a_branch_checked_out_in_another_worktree() {
+    let w = submitted();
+    let wt = worktree(&w, "wt", "feat-a");
+    let a = w.head("feat-a").unwrap();
+    let b = w.head("feat-b").unwrap();
+    let landed = w.advance_main("m.rs", "m\n");
+
+    let out = w.gt_ok(&["sync"]);
+    assert_eq!(w.head("feat-a").as_deref(), Some(a.as_str()), "{out:?}");
+    assert_eq!(w.head("feat-b").as_deref(), Some(b.as_str()), "feat-b stays on feat-a where it is");
+    assert!(out.stderr.contains(&format!("feat-a in {}", wt.display())), "{out:?}");
+    assert!(w.config("branch.feat-a.gtNeedsRebase").is_none(), "held, not marked");
+
+    // Sync in that worktree moves its own branch, and leaves feat-b, checked out here.
+    let out = w.gt_in(&wt, &["sync"]);
+    assert!(out.ok(), "{out:?}");
+    assert_eq!(w.parent("feat-a"), landed);
+    assert_eq!(w.head("feat-b").as_deref(), Some(b.as_str()), "{out:?}");
+    assert!(out.stderr.contains(&format!("feat-b in {}", w.repo.display())), "{out:?}");
+
+    assert_eq!(w.config("branch.feat-b.gtHeldBase").as_deref(), Some(a.as_str()));
+
+    // Back here, feat-b follows with only its own commit, even after an amend.
+    w.write("b.rs", "b2\n");
+    w.gt_ok(&["modify", "-a"]);
+    let out = w.gt_ok(&["sync"]);
+    assert_eq!(w.parent("feat-b"), w.head("feat-a").unwrap(), "{out:?}");
+    assert_eq!(w.count("feat-a..feat-b"), 1);
+    assert_eq!(w.read("b.rs"), "b2\n");
+    assert_eq!(w.config("branch.feat-b.gtHeldBase"), None, "cleared once it restacks");
+}
+
+#[test]
+fn sync_leaves_a_push_to_a_branch_checked_out_in_another_worktree() {
+    let w = submitted();
+    worktree(&w, "wt", "feat-a");
+    let a = w.head("feat-a").unwrap();
+    w.teammate_push("feat-a", "a.rs", "fixed by bot\n", false);
+
+    let out = w.gt_ok(&["sync"]);
+    assert!(!out.stderr.contains("pulled remote changes"), "{out:?}");
+    assert_eq!(w.head("feat-a").as_deref(), Some(a.as_str()));
+    assert!(out.stderr.contains("feat-a in "), "{out:?}");
+}
+
 #[test]
 fn get_pulls_down_a_whole_stack() {
     let w = submitted();

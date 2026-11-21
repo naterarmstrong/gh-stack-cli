@@ -103,7 +103,7 @@ One commit per branch is the simple case, and nothing changes for it. When a bra
 | Command | What it does |
 | --- | --- |
 | `gt submit` (`ss`) | Restack, push, create PRs (title and body from the commit message) or retarget them onto the right base, and link the stack on GitHub. This shares the current branch and every local branch below it; local branches above it stay local (restacked, not pushed). `--draft` opens new PRs as drafts. `--relink` replaces the GitHub stack if it doesn't match the local order. `--skip-conflicts` submits every branch below the nearest one that needs a rebase or would conflict, from anywhere in the stack, and leaves that branch and those above it untouched. `--only` pushes and creates or retargets the PR for the current branch alone, on branches below it that are already submitted; the branches above it are still restacked locally, and one that would conflict is marked as needing a rebase instead of stopping the submit. `--prefer-local` pushes a branch that changed on the remote since gt last synced, overwriting the remote commit gt last fetched. |
-| `gt sync` (`s`) | Fetch, mark merged PRs, pull in commits others pushed to your branches, fast-forward local trunks (including ones checked out in other worktrees), and restack onto trunk. It never pushes: it lists the branches that changed and aren't pushed, and `gt submit` pushes them. A branch that would conflict is left where it is and marked **needs rebase** in `gt log`/`gt ls`; the branches above it are restacked onto it. Sync never stops for a conflict or checks out a branch. See flags below. |
+| `gt sync` (`s`) | Fetch, mark merged PRs, pull in commits others pushed to your branches, fast-forward local trunks, and restack onto trunk. It never changes another worktree: see [Worktrees](#worktrees). It never pushes: it lists the branches that changed and aren't pushed, and `gt submit` pushes them. A branch that would conflict is left where it is and marked **needs rebase** in `gt log`/`gt ls`; the branches above it are restacked onto it. Sync never stops for a conflict or checks out a branch. See flags below. |
 | `gt get <target>` | Pull down a stack from GitHub by PR number, URL or branch. |
 | `gt track [branches…]` | Start tracking existing branches (bottom first) as a local stack. Defaults to the current branch. `--trunk` sets the trunk. |
 
@@ -117,6 +117,10 @@ When someone else pushes to your branch, even with a force push, sync replaces y
 - `--no-prune`: keep local branches of merged PRs, review branches included
 - `--prefer-remote`: when a branch changed both locally and on the remote, take the remote (the default keeps local and warns)
 - `--offline`: skip GitHub API calls and only run git fetch (merged review branches aren't pruned, and branches with no `gtSynced` record can't be checked against GitHub's push history)
+
+#### Worktrees
+
+`gt sync` never moves a branch that's checked out in another worktree: not a stacked branch, not a trunk, not a review branch. It leaves each one where it is and lists it at the end, with the worktree to run `gt sync` in. A held stacked branch is restacked around: the branches above it stay on it where it is, and the next sync that can move it (the one in its own worktree) restacks it. Sync records the commit its own commits sit on as `branch.<name>.gtHeldBase`, so a later restack knows where they start even after the branch below moves or the branch is amended. Other commands, such as `gt restack`, `gt modify` and `gt submit`, still move a branch checked out in another worktree along with the rest of the stack.
 
 ### Local branches
 

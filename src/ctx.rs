@@ -78,6 +78,15 @@ fn rebase_marks(repo: &gix::Repository) -> HashMap<String, (String, Option<Strin
         .collect()
 }
 
+/// Branches `gt sync` held in place because another worktree has them checked
+/// out, marked by `branch.<b>.gtHeldBase` (value: the commit its own commits sit
+/// on). Once the branch below moves, that is the only record of where its own
+/// commits start. Unlike a needs-rebase mark it survives amends, so it counts
+/// while the branch still contains it.
+fn held_bases(repo: &gix::Repository) -> HashMap<String, String> {
+    branch_values(repo, "gtHeldBase")
+}
+
 /// The remote commit gt last reconciled each branch with, `branch.<b>.gtSynced`:
 /// what it last pushed there, or last took from there. The local branch is that
 /// commit plus whatever was done locally since, so it holds no edits of its own
@@ -103,6 +112,7 @@ pub struct Ctx {
     /// Review branches that still exist locally.
     pub reviews: Vec<Review>,
     rebase_marks: HashMap<String, (String, Option<String>)>,
+    held_bases: HashMap<String, String>,
     synced: HashMap<String, String>,
     upstreams: HashMap<String, (String, String)>,
     lock: Option<Lock>,
@@ -125,6 +135,7 @@ impl Ctx {
         let worktrees = git::worktrees(&info.common_dir);
         let upstreams = upstreams(&repo, &tracked);
         let rebase_marks = rebase_marks(&repo);
+        let held_bases = held_bases(&repo);
         let synced = synced(&repo);
         Ok(Ctx {
             info,
@@ -134,6 +145,7 @@ impl Ctx {
             worktrees,
             reviews,
             rebase_marks,
+            held_bases,
             synced,
             upstreams,
             lock,
@@ -167,6 +179,7 @@ impl Ctx {
         self.worktrees = git::worktrees(&self.info.common_dir);
         self.upstreams = upstreams(&repo, &tracked);
         self.rebase_marks = rebase_marks(&repo);
+        self.held_bases = held_bases(&repo);
         self.synced = synced(&repo);
         Ok(())
     }
@@ -176,11 +189,12 @@ impl Ctx {
         self.rebase_marks.get(branch).is_some_and(|(sha, _)| self.refs.head(branch) == Some(sha.as_str()))
     }
 
-    /// The commit a marked branch still sits on: its parent's tip from before the
-    /// parent was restacked. It belongs below the branch and everything above it.
+    /// The commit a marked or held branch still sits on: its parent's tip from
+    /// before the parent was restacked. It belongs below the branch and everything above it.
     pub fn rebase_base(&self, branch: &str) -> Option<&str> {
         if !self.needs_rebase(branch) {
-            return None;
+            let base = self.held_bases.get(branch)?;
+            return self.refs.head(branch).is_some_and(|tip| git::is_ancestor(base, tip)).then_some(base.as_str());
         }
         match &self.rebase_marks.get(branch)?.1 {
             Some(base) => Some(base),
@@ -207,6 +221,20 @@ impl Ctx {
     pub fn clear_needs_rebase(&mut self, branch: &str) {
         if self.rebase_marks.remove(branch).is_some() {
             let _ = git::run(&["config", "--unset", &format!("branch.{branch}.gtNeedsRebase")]);
+        }
+    }
+
+    /// Records that sync held `branch` in place, with its own commits sitting on `base`.
+    pub fn mark_held(&mut self, branch: &str, base: &str) -> Result<()> {
+        git::run(&["config", &format!("branch.{branch}.gtHeldBase"), base])?;
+        self.held_bases.insert(branch.to_string(), base.to_string());
+        Ok(())
+    }
+
+    /// Drops a branch's held mark, if it has one.
+    pub fn clear_held(&mut self, branch: &str) {
+        if self.held_bases.remove(branch).is_some() {
+            let _ = git::run(&["config", "--unset", &format!("branch.{branch}.gtHeldBase")]);
         }
     }
 

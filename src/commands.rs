@@ -11,6 +11,7 @@ use crate::ui;
 use crate::{errln, outln};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 // ───────────────────────────── log ─────────────────────────────
 
@@ -1204,12 +1205,17 @@ fn fetch_reviews(ctx: &Ctx, prs: &HashMap<String, Pr>) {
 
 /// Moves each review branch to its PR head, whether the PR gained commits or
 /// was force-pushed. Local commits on it are dropped (the reflog keeps them);
-/// a checkout whose uncommitted changes are in the way is left alone. One
-/// whose PR merged is left for `prune_reviews`.
-fn update_reviews(ctx: &Ctx, prs: &HashMap<String, Pr>) {
+/// a checkout whose uncommitted changes are in the way is left alone, and so
+/// is one checked out in another worktree. One whose PR merged is left for
+/// `prune_reviews`.
+fn update_reviews(ctx: &Ctx, prs: &HashMap<String, Pr>, held: &mut Vec<(String, PathBuf)>) {
     for r in ctx.reviews.iter().filter(|r| prs.get(&r.branch).is_none_or(|p| p.state != "MERGED")) {
         let (Some(local), Some(tip)) = (ctx.refs.head(&r.branch), ctx.review_tip(r)) else { continue };
         if local == tip {
+            continue;
+        }
+        if let Some(wt) = ctx.other_worktree(&r.branch) {
+            held.push((r.branch.clone(), wt.clone()));
             continue;
         }
         let forced = !git::is_ancestor(local, tip);
@@ -1414,11 +1420,13 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         let review_prs = review_prs(&ctx, opts.offline);
         fetch_reviews(&ctx, &review_prs);
         ctx.reload()?;
-        update_reviews(&ctx, &review_prs);
+        let mut held = vec![];
+        update_reviews(&ctx, &review_prs, &mut held);
         ctx.reload()?;
         if !opts.no_prune {
             prune_reviews(&mut ctx, &review_prs)?;
         }
+        report_held(&held);
         return Ok(());
     }
 
@@ -1480,10 +1488,13 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         ));
         fetch(&ctx, &present)?;
     }
+    // Sync never moves a branch checked out in another worktree, so running it
+    // in one checkout can't reach into another; each is listed at the end.
+    let mut held: Vec<(String, PathBuf)> = vec![];
     let review_prs = review_prs(&ctx, opts.offline);
     fetch_reviews(&ctx, &review_prs);
     ctx.reload()?;
-    update_reviews(&ctx, &review_prs);
+    update_reviews(&ctx, &review_prs, &mut held);
     ctx.reload()?;
     if !opts.no_prune {
         prune_reviews(&mut ctx, &review_prs)?;
@@ -1581,7 +1592,9 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
     }
     let mut diverged = vec![];
     for p in pulls {
-        if p.stale || (p.moved && opts.prefer_remote) {
+        if let Some(wt) = ctx.other_worktree(&p.branch).filter(|_| p.stale || p.moved) {
+            held.push((p.branch, wt.clone()));
+        } else if p.stale || (p.moved && opts.prefer_remote) {
             adopt_remote(&mut ctx, &p.branch, &p.parent_ref, &p.below)?;
         } else if p.moved {
             ui::warn(&format!("{} changed both locally and on {} — keeping local", p.branch, ctx.remote));
@@ -1590,13 +1603,18 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
     }
     ctx.reload()?;
 
-    // 5. Fast-forward local trunks, including ones checked out in a worktree,
-    // but only when they have no commits that aren't on the remote.
+    // 5. Fast-forward local trunks, including one checked out in this worktree,
+    // but only when they have no commits that aren't on the remote. Restacking
+    // goes onto the remote trunk, so a trunk held in another worktree is fine.
     let mut trunks: Vec<String> = sis.iter().map(|&si| ctx.store.file.stacks[si].trunk.branch.clone()).collect();
     trunks.dedup();
     for trunk in trunks {
         let (Some(l), Some(r)) = (ctx.refs.head(&trunk), ctx.refs.remote.get(&trunk)) else { continue };
         if l == r || !git::is_ancestor(l, r) {
+            continue;
+        }
+        if let Some(wt) = ctx.other_worktree(&trunk) {
+            held.push((trunk, wt.clone()));
             continue;
         }
         let (l, r) = (l.to_string(), r.clone());
@@ -1605,7 +1623,7 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
             Some(wt) => {
                 let out = git::run_raw(Some(wt), &["merge", "--ff-only", "--quiet", &r], None, &[])?;
                 if !out.ok {
-                    ui::warn(&format!("couldn't fast-forward {trunk} in {}: {}", wt.display(), out.stderr.trim()));
+                    ui::warn(&format!("couldn't fast-forward {trunk}: {}", out.stderr.trim()));
                     continue;
                 }
             }
@@ -1624,10 +1642,22 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         if ctx.store.file.stacks[si].fully_merged() {
             continue;
         }
-        match restack::run_skipping(&mut ctx, si, true) {
-            Ok(s) => {
+        let hold: Vec<String> = ctx.store.file.stacks[si]
+            .branches
+            .iter()
+            .filter(|b| ctx.other_worktree(&b.branch).is_some())
+            .map(|b| b.branch.clone())
+            .collect();
+        match restack::run_skipping(&mut ctx, si, true, &hold) {
+            Ok((s, h)) => {
                 restacked.push(si);
                 skipped.extend(s);
+                for b in h {
+                    if !held.iter().any(|(x, _)| *x == b) {
+                        let wt = ctx.other_worktree(&b).cloned().unwrap_or_default();
+                        held.push((b, wt));
+                    }
+                }
             }
             Err(e) => {
                 ui::warn(&format!("not restacking the stack on {}: {e:#}", ctx.store.file.stacks[si].trunk.branch))
@@ -1677,6 +1707,7 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
             unpushed.iter().map(|b| ui::bold(b)).collect::<Vec<_>>().join(", ")
         );
     }
+    report_held(&held);
     // Submit won't push these until one side wins.
     if !diverged.is_empty() {
         errln!(
@@ -1686,6 +1717,15 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Lists the branches sync left alone because another worktree has them checked out.
+fn report_held(held: &[(String, PathBuf)]) {
+    if held.is_empty() {
+        return;
+    }
+    let lines: Vec<String> = held.iter().map(|(b, wt)| format!("    {} in {}", ui::bold(b), wt.display())).collect();
+    errln!("\nLeft alone, checked out in another worktree; run `gt sync` there to update:\n{}", lines.join("\n"));
 }
 
 /// Tracks the open PRs GitHub's stack has above the highest one tracked
@@ -2123,7 +2163,7 @@ pub fn submit(
         first.and_then(|c| ctx.store.file.stacks[si].index_of(&c.branch)).is_some_and(|i| i > idx)
     };
     if conflict_above {
-        restack::run_skipping(&mut ctx, si, false)?;
+        restack::run_skipping(&mut ctx, si, false, &[])?;
     } else if stop.is_none() && !restack::run(&mut ctx, si, false)? {
         ctx.save()?;
         journal::exit(1);
