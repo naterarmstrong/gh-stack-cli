@@ -86,6 +86,7 @@ One commit per branch is the simple case, and nothing changes for it. When a bra
 | `gt top` (`t`) / `gt bottom` (`b`) | Check out the top or bottom of the stack. |
 | `gt trunk` | Check out the stack's trunk. |
 | `gt checkout [target]` (`co`) | Check out by branch name or PR number, or `-` for the last branch you were on (skipping ones deleted since). With no target, opens an interactive picker. |
+| `gt park` | Leave this worktree on the trunk's latest remote commit with no branch checked out, so it holds no branch. See [Parking a worktree](#parking-a-worktree). |
 
 ### Editing
 
@@ -121,6 +122,14 @@ When someone else pushes to your branch, even with a force push, sync replaces y
 #### Worktrees
 
 `gt sync` never moves a branch that's checked out in another worktree: not a stacked branch, not a trunk, not a review branch. It leaves each one where it is and lists it at the end, with the worktree to run `gt sync` in. A held stacked branch is restacked around: the branches above it stay on it where it is, and the next sync that can move it (the one in its own worktree) restacks it. Sync records the commit its own commits sit on as `branch.<name>.gtHeldBase`, so a later restack knows where they start even after the branch below moves or the branch is amended. Other commands, such as `gt restack`, `gt modify` and `gt submit`, still move a branch checked out in another worktree along with the rest of the stack.
+
+#### Parking a worktree
+
+`gt park` fetches the trunk and checks out its remote tip detached, so the worktree holds no branch and every branch it had is free to check out elsewhere or for `gt sync` to move. It parks on the current stack's trunk, or the remote's default branch; `--trunk` picks another. It refuses with uncommitted changes to tracked files or a rebase in progress. The mark is `gt-parked` in the worktree's own git dir (`.git/worktrees/<name>/`, or `.git` for the main checkout).
+
+`gt sync` in a parked worktree fetches the trunk and moves HEAD to its new tip, carrying local changes the way `git checkout` does, even with no stacks to sync. If HEAD moved off where gt left it, say for a commit made while parked, sync leaves it and warns; `gt create` keeps that commit on a new branch, and `gt park` moves to the tip instead. Sync in another worktree never moves a parked one.
+
+`gt co <branch>` (or `gt co -` for the branch you parked from) ends the park, and so does `gt create`, which starts a new stack on the trunk at the commit you're parked on. Commands that need a current branch, such as `gt modify` and `gt submit`, say the worktree is parked. `gt ls` draws `parked: <worktree>` on the trunk's line, with `here` for this one.
 
 ### Local branches
 

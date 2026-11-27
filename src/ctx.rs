@@ -1,4 +1,4 @@
-use crate::git::{self, Refs, RepoInfo};
+use crate::git::{self, Parked, Refs, RepoInfo};
 use crate::github::{Client, PrQuery};
 use crate::state::{Lock, Store};
 use anyhow::{Result, anyhow, bail};
@@ -109,6 +109,8 @@ pub struct Ctx {
     pub remote: String,
     pub refs: Refs,
     pub worktrees: HashMap<String, PathBuf>,
+    /// Worktrees `gt park` left with no branch, this one included.
+    pub parked: Vec<Parked>,
     /// Review branches that still exist locally.
     pub reviews: Vec<Review>,
     rebase_marks: HashMap<String, (String, Option<String>)>,
@@ -134,6 +136,7 @@ impl Ctx {
         let refs = Refs::load(&repo, &remote, &tracked)?;
         reviews.retain(|r| refs.heads.contains_key(&r.branch));
         let worktrees = git::worktrees(&info.common_dir);
+        let parked = git::parked(&info.common_dir);
         let upstreams = upstreams(&repo, &tracked);
         let rebase_marks = rebase_marks(&repo);
         let held_bases = held_bases(&repo);
@@ -144,6 +147,7 @@ impl Ctx {
             remote,
             refs,
             worktrees,
+            parked,
             reviews,
             rebase_marks,
             held_bases,
@@ -178,6 +182,7 @@ impl Ctx {
         reviews.retain(|r| self.refs.heads.contains_key(&r.branch));
         self.reviews = reviews;
         self.worktrees = git::worktrees(&self.info.common_dir);
+        self.parked = git::parked(&self.info.common_dir);
         self.upstreams = upstreams(&repo, &tracked);
         self.rebase_marks = rebase_marks(&repo);
         self.held_bases = held_bases(&repo);
@@ -285,7 +290,22 @@ impl Ctx {
     }
 
     pub fn current(&self) -> Result<&str> {
-        self.info.current_branch.as_deref().ok_or_else(|| anyhow!("HEAD is detached"))
+        if let Some(b) = self.info.current_branch.as_deref() {
+            return Ok(b);
+        }
+        match self.parked_here() {
+            Some(p) => bail!(
+                "this worktree is parked on {} with no branch; `gt co <branch>` picks one up, `gt create` starts one on {}",
+                p.trunk,
+                p.trunk
+            ),
+            None => bail!("HEAD is detached"),
+        }
+    }
+
+    /// This worktree's park mark, if `gt park` left it with no branch.
+    pub fn parked_here(&self) -> Option<&Parked> {
+        self.parked.iter().find(|p| p.worktree == self.info.toplevel)
     }
 
     /// Index of the stack containing the current branch.

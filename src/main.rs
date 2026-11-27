@@ -54,6 +54,14 @@ enum Cmd {
     /// (interactive picker if omitted)
     #[command(visible_alias = "co")]
     Checkout { target: Option<String> },
+    /// Leave this worktree on the trunk's latest remote commit with no branch checked out,
+    /// so it holds none. `gt sync` here keeps it on the tip; `gt co` or `gt create` picks a
+    /// branch back up.
+    Park {
+        /// Trunk to park on (default: the current stack's trunk, else the remote's default branch)
+        #[arg(long)]
+        trunk: Option<String>,
+    },
     /// Create a branch above the current one and commit staged changes to it
     #[command(visible_alias = "c")]
     Create {
@@ -265,6 +273,7 @@ fn main() {
         Cmd::Bottom => commands::nav(Nav::Bottom),
         Cmd::Trunk => commands::nav(Nav::Trunk),
         Cmd::Checkout { target } => commands::checkout_cmd(target),
+        Cmd::Park { trunk } => commands::park(trunk),
         Cmd::Create { name, message, all, base } => commands::create(name, message, all, base),
         Cmd::Modify { all, message, new_commit } => commands::modify(all, message, new_commit),
         Cmd::Restack { trunk } => commands::restack_cmd(trunk),

@@ -236,30 +236,79 @@ impl Refs {
     }
 }
 
-/// Map of branch name -> worktree path, read straight from `.git/worktrees`.
-pub fn worktrees(common_dir: &Path) -> HashMap<String, PathBuf> {
-    let branch_of = |head_file: PathBuf| {
-        std::fs::read_to_string(head_file)
-            .ok()
-            .and_then(|h| h.trim().strip_prefix("ref: refs/heads/").map(str::to_string))
-    };
-    let mut map = HashMap::new();
-    if let (Some(b), Some(main)) = (branch_of(common_dir.join("HEAD")), common_dir.parent()) {
-        map.insert(b, main.to_path_buf());
+/// Every checkout's (git dir, worktree path): the main one, then each linked
+/// worktree that still exists, read straight from `.git/worktrees`.
+fn checkouts(common_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let mut v = vec![];
+    if let Some(main) = common_dir.parent() {
+        v.push((common_dir.to_path_buf(), main.to_path_buf()));
     }
-    let Ok(entries) = std::fs::read_dir(common_dir.join("worktrees")) else { return map };
+    let Ok(entries) = std::fs::read_dir(common_dir.join("worktrees")) else { return v };
     for e in entries.flatten() {
         let dir = e.path();
         let wt = std::fs::read_to_string(dir.join("gitdir"))
             .ok()
             .and_then(|g| Path::new(g.trim()).parent().map(Path::to_path_buf));
-        if let (Some(b), Some(wt)) = (branch_of(dir.join("HEAD")), wt) {
-            if wt.exists() {
-                map.insert(b, std::fs::canonicalize(&wt).unwrap_or(wt));
-            }
+        if let Some(wt) = wt.filter(|wt| wt.exists()) {
+            v.push((dir, std::fs::canonicalize(&wt).unwrap_or(wt)));
         }
     }
-    map
+    v
+}
+
+/// Map of branch name -> worktree path, read straight from `.git/worktrees`.
+pub fn worktrees(common_dir: &Path) -> HashMap<String, PathBuf> {
+    checkouts(common_dir)
+        .into_iter()
+        .filter_map(|(dir, wt)| {
+            let head = std::fs::read_to_string(dir.join("HEAD")).ok()?;
+            Some((head.trim().strip_prefix("ref: refs/heads/")?.to_string(), wt))
+        })
+        .collect()
+}
+
+/// A worktree `gt park` left on a trunk's tip with no branch checked out, so
+/// it holds none. Marked by `gt-parked` in its git dir: the trunk and the commit.
+#[derive(Clone, Debug)]
+pub struct Parked {
+    pub worktree: PathBuf,
+    pub trunk: String,
+    pub sha: String,
+    /// HEAD is still detached but no longer where `gt park` or `gt sync` put it
+    /// (a commit made while parked, or a checkout of some other commit).
+    pub moved: bool,
+}
+
+const PARK_FILE: &str = "gt-parked";
+
+/// The worktree's park mark, if its HEAD is still detached. One whose HEAD is
+/// back on a branch is no longer parked, and its stale mark is removed.
+fn read_parked(git_dir: &Path, worktree: PathBuf) -> Option<Parked> {
+    let mark = std::fs::read_to_string(git_dir.join(PARK_FILE)).ok()?;
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    if head.starts_with("ref:") {
+        let _ = std::fs::remove_file(git_dir.join(PARK_FILE));
+        return None;
+    }
+    let (trunk, sha) = mark.trim().split_once(' ')?;
+    Some(Parked { worktree, trunk: trunk.to_string(), sha: sha.to_string(), moved: head != sha })
+}
+
+/// Every parked worktree, this one included.
+pub fn parked(common_dir: &Path) -> Vec<Parked> {
+    checkouts(common_dir).into_iter().filter_map(|(dir, wt)| read_parked(&dir, wt)).collect()
+}
+
+/// Drops the worktree's park mark, once it's back on a branch.
+pub fn clear_parked(git_dir: &Path) {
+    let _ = std::fs::remove_file(git_dir.join(PARK_FILE));
+}
+
+/// Marks the worktree with git dir `git_dir` as parked on `trunk` at `sha`.
+pub fn write_parked(git_dir: &Path, trunk: &str, sha: &str) -> Result<()> {
+    std::fs::write(git_dir.join(PARK_FILE), format!("{trunk} {sha}\n"))?;
+    Ok(())
 }
 
 pub fn rev_parse(rev: &str) -> Option<String> {
@@ -423,6 +472,11 @@ pub fn is_clean(dir: Option<&Path>) -> Result<bool> {
 
 pub fn has_staged_changes() -> Result<bool> {
     Ok(!run_raw(None, &["diff", "--cached", "--quiet"], None, &[])?.ok)
+}
+
+/// Whether tracked files differ from HEAD, staged or not.
+pub fn has_tracked_changes() -> Result<bool> {
+    Ok(!run(&["status", "--porcelain", "--untracked-files=no"])?.trim().is_empty())
 }
 
 pub fn rebase_in_progress(git_dir: &Path) -> bool {

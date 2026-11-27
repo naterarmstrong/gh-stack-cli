@@ -293,7 +293,11 @@ fn graph_rows(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bool)
         let marker = if cur == Some(*trunk) { ui::cyan("◉") } else { "◯".to_string() };
         let fan = (1..cols).map(|c| if c == cols - 1 { "─┘" } else { "─┴" }).collect::<String>();
         let name = if cur == Some(*trunk) { ui::bold(&ui::cyan(trunk)) } else { ui::dim(trunk) };
-        let badges: Vec<String> = worktree_badge(ctx, trunk).into_iter().chain(trunk_badge(ctx, trunk)).collect();
+        let badges: Vec<String> = worktree_badge(ctx, trunk)
+            .into_iter()
+            .chain(trunk_badge(ctx, trunk))
+            .chain(parked_badge(ctx, trunk))
+            .collect();
         let badges = if badges.is_empty() { String::new() } else { format!("  {}", badges.join(&ui::dim(" · "))) };
         rows.push(Row {
             text: format!("{marker}{}  {name}{badges}", ui::dim(&fan)),
@@ -302,6 +306,23 @@ fn graph_rows(ctx: &Ctx, sis: &[usize], prs: &HashMap<String, Pr>, detail: bool)
         });
     }
     rows
+}
+
+/// Dim "parked: wt-one, here" for the worktrees `gt park` left on this trunk.
+fn parked_badge(ctx: &Ctx, trunk: &str) -> Option<String> {
+    let names: Vec<String> = ctx
+        .parked
+        .iter()
+        .filter(|p| p.trunk == trunk)
+        .map(|p| {
+            if p.worktree == ctx.info.toplevel {
+                "here".to_string()
+            } else {
+                p.worktree.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            }
+        })
+        .collect();
+    (!names.is_empty()).then(|| ui::dim(&format!("parked: {}", names.join(", "))))
 }
 
 /// `origin/main` when the remote trunk is known (what stacks rebase onto), else `main`.
@@ -625,6 +646,9 @@ fn query_prs(ctx: &Ctx, queries: Vec<(String, PrQuery)>, strict: bool) -> Result
 
 pub fn log(stack_only: bool, offline: bool) -> Result<()> {
     let ctx = Ctx::new(false)?;
+    if let Some(p) = ctx.parked_here() {
+        ui::info(&parked_note(&ctx, p));
+    }
     let sis = stacks_to_show(&ctx, !stack_only);
     // Review branches belong to no stack, so only the full view shows them.
     let show_reviews =
@@ -676,6 +700,7 @@ fn checkout(ctx: &Ctx, branch: &str) -> Result<()> {
     if !out.ok {
         bail!("{}", out.stderr.trim());
     }
+    git::clear_parked(&ctx.info.git_dir);
     ctx.ensure_upstreams([branch]);
     ui::ok(&format!("checked out {}", ui::bold(branch)));
     Ok(())
@@ -853,10 +878,14 @@ fn slug(msg: &str) -> String {
 
 pub fn create(name: Option<String>, message: Option<String>, all: bool, base: Option<String>) -> Result<()> {
     let mut ctx = Ctx::new(true)?;
-    let cur = match &base {
-        Some(b) => resolve_branch(&ctx, b)?,
-        None => ctx.current()?.to_string(),
+    // A parked worktree starts the branch on its trunk, from the commit it's parked on.
+    let parked_trunk = base.is_none().then(|| ctx.parked_here().map(|p| p.trunk.clone())).flatten();
+    let cur = match (&base, &parked_trunk) {
+        (Some(b), _) => resolve_branch(&ctx, b)?,
+        (None, Some(t)) => t.clone(),
+        (None, None) => ctx.current()?.to_string(),
     };
+    let start = if parked_trunk.is_some() { "HEAD".to_string() } else { cur.clone() };
     let name = match (name, &message) {
         (Some(n), _) => n,
         (None, Some(m)) if !slug(m).is_empty() => slug(m),
@@ -870,7 +899,9 @@ pub fn create(name: Option<String>, message: Option<String>, all: bool, base: Op
     let (si, insert_at) = match ctx.store.file.find(&cur) {
         Some(si) => (si, ctx.store.file.stacks[si].index_of(&cur).unwrap() + 1),
         None => {
-            let is_trunk = cur == ctx.default_trunk() || ctx.store.file.stacks.iter().any(|s| s.trunk.branch == cur);
+            let is_trunk = parked_trunk.is_some()
+                || cur == ctx.default_trunk()
+                || ctx.store.file.stacks.iter().any(|s| s.trunk.branch == cur);
             let mut stack = Stack {
                 trunk: BranchRef::new(&if is_trunk { cur.clone() } else { ctx.default_trunk() }),
                 local: true,
@@ -897,7 +928,8 @@ pub fn create(name: Option<String>, message: Option<String>, all: bool, base: Op
     {
         bail!("nothing created");
     }
-    git::run(&["checkout", "--quiet", "-b", &name, &cur])?;
+    git::run(&["checkout", "--quiet", "-b", &name, &start])?;
+    git::clear_parked(&ctx.info.git_dir);
     if staged {
         let ok = match &message {
             Some(m) => git::run_interactive(None, &["commit", "--quiet", "-m", m])?,
@@ -1472,7 +1504,12 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
     let mut ctx = Ctx::new(true)?;
     let sis = stacks_to_show(&ctx, opts.all);
     if sis.is_empty() {
-        if ctx.reviews.is_empty() {
+        if ctx.parked_here().is_some() {
+            sync_parked(&mut ctx)?;
+            if ctx.reviews.is_empty() {
+                return Ok(());
+            }
+        } else if ctx.reviews.is_empty() {
             bail!("nothing to sync");
         }
         let review_prs = review_prs(&ctx, opts.offline);
@@ -1529,6 +1566,7 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
             }
         }
     }
+    to_fetch.extend(ctx.parked_here().map(|p| p.trunk.clone()));
     to_fetch.sort();
     to_fetch.dedup();
     if let Err(e) = fetch(&ctx, &to_fetch) {
@@ -1690,6 +1728,7 @@ pub fn sync(opts: SyncOpts) -> Result<()> {
         }
         ui::ok(&format!("fast-forwarded {trunk} {} → {}", ui::dim(ui::short(&l)), ui::short(&r)));
     }
+    advance_parked(&ctx);
     ctx.reload()?;
 
     // 6. Restack every stack onto its updated trunk. A branch that conflicts
@@ -2051,6 +2090,96 @@ fn prune(ctx: &mut Ctx, sis: &[usize], prs: &HashMap<String, Pr>, offline: bool)
         }
     }
     ctx.reload()
+}
+
+// ───────────────────────────── park ─────────────────────────────
+
+/// Leaves this worktree on its trunk's remote tip with no branch checked out,
+/// so it holds no branch any other worktree or `gt sync` might want to move.
+/// `gt sync` run here keeps it on the tip; `gt co`/`gt create` end it.
+pub fn park(trunk: Option<String>) -> Result<()> {
+    let mut ctx = Ctx::new(false)?;
+    let trunk = trunk
+        .or_else(|| ctx.parked_here().map(|p| p.trunk.clone()))
+        .or_else(|| {
+            let si = ctx.store.file.find(ctx.info.current_branch.as_deref()?)?;
+            Some(ctx.store.file.stacks[si].trunk.branch.clone())
+        })
+        .unwrap_or_else(|| ctx.default_trunk());
+    if git::rebase_in_progress(&ctx.info.git_dir) {
+        bail!("a rebase is in progress; finish it with `gt continue` or back out with `gt abort` first");
+    }
+    if git::has_tracked_changes()? {
+        bail!("this worktree has uncommitted changes; commit or stash them before parking");
+    }
+    if let Err(e) = fetch(&ctx, std::slice::from_ref(&trunk)) {
+        ui::warn(&format!("{e:#}; parking on what was last fetched"));
+    }
+    ctx.reload()?;
+    let tip = ctx.trunk_tip(&trunk)?;
+    let left = ctx.info.current_branch.clone();
+    let out = git::run_raw(None, &["checkout", "--quiet", "--detach", &tip], None, &[])?;
+    if !out.ok {
+        bail!("{}", out.stderr.trim());
+    }
+    git::write_parked(&ctx.info.git_dir, &trunk, &tip)?;
+    ctx.reload()?;
+    let p = ctx.parked_here().ok_or_else(|| anyhow!("internal: park mark not found"))?;
+    ui::ok(&parked_note(&ctx, p));
+    if let Some(b) = left {
+        ui::info(&format!("left {}; `gt co -` goes back to it", ui::bold(&b)));
+    }
+    Ok(())
+}
+
+/// "parked on origin/main at 1a2b3c4d, no branch checked out".
+fn parked_note(ctx: &Ctx, p: &git::Parked) -> String {
+    let moved = if p.moved { " (HEAD has moved since)" } else { "" };
+    format!("parked on {} at {}{moved}, no branch checked out", trunk_label(ctx, &p.trunk), ui::short(&p.sha))
+}
+
+/// `gt sync` in a parked worktree with no stacks or review branches to sync:
+/// fetch its trunk and move HEAD to the new tip.
+fn sync_parked(ctx: &mut Ctx) -> Result<()> {
+    let Some(trunk) = ctx.parked_here().map(|p| p.trunk.clone()) else { return Ok(()) };
+    fetch(ctx, &[trunk])?;
+    ctx.reload()?;
+    advance_parked(ctx);
+    ctx.reload()
+}
+
+/// Moves this parked worktree's HEAD to its trunk's remote tip, carrying local
+/// changes the way `git checkout` does. A HEAD that moved off where gt left it
+/// (a commit made while parked) stays put, so nothing is orphaned.
+fn advance_parked(ctx: &Ctx) {
+    let Some(p) = ctx.parked_here() else { return };
+    let Some(tip) = ctx.refs.remote.get(&p.trunk) else { return };
+    if p.moved {
+        ui::warn(&format!(
+            "HEAD moved off where gt parked it on {}; leaving it (`gt create` keeps commits made since, `gt park` moves to the tip)",
+            trunk_label(ctx, &p.trunk)
+        ));
+        return;
+    }
+    if *tip == p.sha {
+        return;
+    }
+    let ok = git::run_raw(None, &["checkout", "--quiet", "--detach", tip], None, &[]);
+    match ok {
+        Ok(o) if o.ok => {
+            if let Err(e) = git::write_parked(&ctx.info.git_dir, &p.trunk, tip) {
+                ui::warn(&format!("couldn't update the park mark: {e:#}"));
+            }
+            ui::ok(&format!(
+                "moved parked worktree to {} {} → {}",
+                trunk_label(ctx, &p.trunk),
+                ui::dim(ui::short(&p.sha)),
+                ui::short(tip)
+            ));
+        }
+        Ok(o) => ui::warn(&format!("couldn't move parked worktree (local changes in the way?): {}", o.stderr.trim())),
+        Err(e) => ui::warn(&format!("couldn't move parked worktree: {e:#}")),
+    }
 }
 
 /// Moves this worktree off a merged branch: to the next unmerged branch in the
